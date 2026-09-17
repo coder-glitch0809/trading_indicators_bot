@@ -6,8 +6,8 @@
 #property version   "0.1"
 #include <Trade/Trade.mqh>
 
-input string ServerUrl = "https://YOUR_DOMAIN";
-input string ApiKey = "CHANGE_ME";
+input string ServerUrl = "https://server-xi-rose-97.vercel.app/";
+input string ApiKey = "mt5_mql5_secret_key";
 input string SymbolOverride = "";              // e.g. XAUUSD.a; blank = current chart
 input double MaxRiskPercent = 0.50;
 input int PollSeconds = 10;
