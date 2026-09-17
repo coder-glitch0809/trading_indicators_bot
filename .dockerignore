@@ -1,0 +1,6 @@
+.git
+.env
+server/.env
+server/signals.sqlite3
+__pycache__
+*.pyc

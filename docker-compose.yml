@@ -1,0 +1,9 @@
+services:
+  ai-zone-trader:
+    build: .
+    env_file: ./server/.env
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./server:/app/server
+    restart: unless-stopped

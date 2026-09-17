@@ -1,0 +1,82 @@
+//@version=6
+indicator("AI Zone Trader — Confirmed Signals", overlay=true, max_boxes_count=20, max_labels_count=100)
+
+// This script is deterministic. It does not claim to predict price or call AI APIs;
+// it emits a structured candidate that the server may filter further.
+fastLen       = input.int(21, "Fast EMA", minval=1)
+slowLen       = input.int(55, "Slow EMA", minval=2)
+rsiLen        = input.int(14, "RSI length", minval=2)
+atrLen        = input.int(14, "ATR length", minval=2)
+pivotBars     = input.int(5, "Zone pivot bars", minval=2, maxval=20)
+rr1           = input.float(1.2, "TP1 R multiple", minval=0.5)
+rr2           = input.float(2.0, "TP2 R multiple", minval=1.0)
+rr3           = input.float(3.0, "TP3 R multiple", minval=1.5)
+riskPct       = input.float(0.5, "Risk % suggested", minval=0.1, maxval=2.0, step=0.1)
+webhookSecret = input.string("CHANGE_ME", "Webhook secret", confirm=true)
+alertsEnabled = input.bool(true, "Enable webhook alerts")
+
+emaFast = ta.ema(close, fastLen)
+emaSlow = ta.ema(close, slowLen)
+rsi = ta.rsi(close, rsiLen)
+[macdLine, signalLine, hist] = ta.macd(close, 12, 26, 9)
+atr = ta.atr(atrLen)
+
+pl = ta.pivotlow(low, pivotBars, pivotBars)
+ph = ta.pivothigh(high, pivotBars, pivotBars)
+var float demandLow = na
+var float demandHigh = na
+var float supplyLow = na
+var float supplyHigh = na
+if not na(pl)
+    demandLow := pl - atr[pivotBars] * 0.20
+    demandHigh := pl + atr[pivotBars] * 0.35
+if not na(ph)
+    supplyLow := ph - atr[pivotBars] * 0.35
+    supplyHigh := ph + atr[pivotBars] * 0.20
+
+var box demandBox = na
+var box supplyBox = na
+if not na(demandLow)
+    box.delete(demandBox)
+    demandBox := box.new(bar_index - pivotBars, demandHigh, bar_index + 1, demandLow, bgcolor=color.new(color.green, 87), border_color=color.new(color.green, 40), extend=extend.right)
+if not na(supplyLow)
+    box.delete(supplyBox)
+    supplyBox := box.new(bar_index - pivotBars, supplyHigh, bar_index + 1, supplyLow, bgcolor=color.new(color.red, 87), border_color=color.new(color.red, 40), extend=extend.right)
+
+upTrend = emaFast > emaSlow and close > emaFast
+downTrend = emaFast < emaSlow and close < emaFast
+longSetup = barstate.isconfirmed and not na(demandLow) and upTrend and rsi > 50 and rsi < 70 and macdLine > signalLine and low <= demandHigh
+shortSetup = barstate.isconfirmed and not na(supplyHigh) and downTrend and rsi < 50 and rsi > 30 and macdLine < signalLine and high >= supplyLow
+
+longEntry = demandHigh
+longSL = demandLow - atr * 0.45
+longRisk = longEntry - longSL
+longTP1 = longEntry + longRisk * rr1
+longTP2 = longEntry + longRisk * rr2
+longTP3 = longEntry + longRisk * rr3
+shortEntry = supplyLow
+shortSL = supplyHigh + atr * 0.45
+shortRisk = shortSL - shortEntry
+shortTP1 = shortEntry - shortRisk * rr1
+shortTP2 = shortEntry - shortRisk * rr2
+shortTP3 = shortEntry - shortRisk * rr3
+
+plot(emaFast, "EMA fast", color=color.teal)
+plot(emaSlow, "EMA slow", color=color.orange)
+plotshape(longSetup, title="BUY candidate", text="BUY\nCONFIRM", style=shape.labelup, location=location.belowbar, color=color.green, textcolor=color.white, size=size.small)
+plotshape(shortSetup, title="SELL candidate", text="SELL\nCONFIRM", style=shape.labeldown, location=location.abovebar, color=color.red, textcolor=color.white, size=size.small)
+
+confidenceLong = math.round((upTrend ? 35 : 0) + (rsi > 50 ? 20 : 0) + (macdLine > signalLine ? 20 : 0) + (low <= demandHigh ? 25 : 0))
+confidenceShort = math.round((downTrend ? 35 : 0) + (rsi < 50 ? 20 : 0) + (macdLine < signalLine ? 20 : 0) + (high >= supplyLow ? 25 : 0))
+
+f_num(x) => str.tostring(x, format.mintick)
+f_payload(side, orderType, entry, zLow, zHigh, sl, tp1, tp2, tp3, confidence) =>
+    '{"secret":"' + webhookSecret + '","symbol":"' + syminfo.ticker + '","timeframe":"' + timeframe.period + '","side":"' + side + '","order_type":"' + orderType + '","price":' + f_num(close) + ',"entry":' + f_num(entry) + ',"zone_low":' + f_num(zLow) + ',"zone_high":' + f_num(zHigh) + ',"sl":' + f_num(sl) + ',"tp1":' + f_num(tp1) + ',"tp2":' + f_num(tp2) + ',"tp3":' + f_num(tp3) + ',"ema_fast":' + f_num(emaFast) + ',"ema_slow":' + f_num(emaSlow) + ',"rsi":' + str.tostring(rsi) + ',"macd":' + str.tostring(macdLine) + ',"macd_signal":' + str.tostring(signalLine) + ',"atr":' + f_num(atr) + ',"risk_pct":' + str.tostring(riskPct) + ',"confidence":' + str.tostring(confidence) + ',"analysis":"EMA trend + RSI + MACD + pivot zone"}'
+
+if longSetup and alertsEnabled
+    alert(f_payload("BUY", "LIMIT", longEntry, demandLow, demandHigh, longSL, longTP1, longTP2, longTP3, confidenceLong), alert.freq_once_per_bar_close)
+if shortSetup and alertsEnabled
+    alert(f_payload("SELL", "LIMIT", shortEntry, supplyLow, supplyHigh, shortSL, shortTP1, shortTP2, shortTP3, confidenceShort), alert.freq_once_per_bar_close)
+
+alertcondition(longSetup, "BUY candidate", "BUY candidate confirmed — use alert() webhook payload")
+alertcondition(shortSetup, "SELL candidate", "SELL candidate confirmed — use alert() webhook payload")
