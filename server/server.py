@@ -3,6 +3,7 @@ import json
 import os
 import secrets
 import sqlite3
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
@@ -12,7 +13,12 @@ from flask import Flask, Response, abort, jsonify, request
 
 load_dotenv()
 app = Flask(__name__)
-DB_PATH = os.path.join(os.path.dirname(__file__), "signals.sqlite3")
+# Vercel's deployment filesystem is read-only. Files in /tmp are writable for
+# the lifetime of a warm function instance; local development keeps its DB here.
+if os.environ.get("VERCEL"):
+    DB_PATH = os.path.join("/tmp" if os.name != "nt" else tempfile.gettempdir(), "signals.sqlite3")
+else:
+    DB_PATH = os.path.join(os.path.dirname(__file__), "signals.sqlite3")
 TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 OWNER_CHAT_ID = str(os.environ.get("TELEGRAM_CHAT_ID", ""))
 APP_KEY = os.environ.get("APP_API_KEY", "")
@@ -214,7 +220,15 @@ def mt5_ack(signal_id):
 def health():
     return jsonify(ok=True, telegram_configured=bool(TG_TOKEN), owner_configured=bool(owner_chat_id()), openai_configured=bool(OPENAI_KEY), gemini_configured=bool(GEMINI_KEY))
 
+@app.get("/")
+def index():
+    return jsonify(service="AI Zone Trader", health="/health", status="running")
+
 if __name__ == "__main__":
     init_db()
     configure_telegram_webhook()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+else:
+    # Vercel imports the Flask app instead of running this file as __main__.
+    init_db()
+    configure_telegram_webhook()
