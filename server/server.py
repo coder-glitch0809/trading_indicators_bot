@@ -1,4 +1,5 @@
 """TradingView webhook -> Telegram confirmation -> MT5 command queue."""
+import io
 import json
 import os
 import secrets
@@ -10,6 +11,13 @@ from datetime import datetime, timezone
 import requests
 from dotenv import load_dotenv
 from flask import Flask, Response, abort, jsonify, request
+
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+except Exception:  # pragma: no cover - optional dependency handled at runtime
+    plt = None
 
 load_dotenv()
 app = Flask(__name__)
@@ -46,7 +54,7 @@ def init_db():
         con.execute("""CREATE TABLE IF NOT EXISTS signals (
           id TEXT PRIMARY KEY, created_at TEXT, symbol TEXT, side TEXT, order_type TEXT,
           entry REAL, zone_low REAL, zone_high REAL, sl REAL, tp1 REAL, tp2 REAL, tp3 REAL,
-          risk_pct REAL, confidence INTEGER, analysis TEXT, status TEXT DEFAULT 'pending')""")
+          risk_pct REAL, confidence INTEGER, pattern TEXT, timeframe TEXT, analysis TEXT, status TEXT DEFAULT 'pending')""")
         con.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
         if OWNER_CHAT_ID:
             con.execute("INSERT OR IGNORE INTO settings(key,value) VALUES ('owner_chat_id',?)", (OWNER_CHAT_ID,))
@@ -119,8 +127,156 @@ def consensus(signal):
     flags = "; ".join(r["risk_flag"] for r in reviews if r["risk_flag"].lower() != "none")
     return all(r["approve"] for r in reviews) and score >= AI_MIN_CONFIDENCE, score, (details + (" | Risk: " + flags if flags else ""))[:450]
 
+def structure_label(signal):
+    pattern = str(signal.get("pattern", "")).upper().strip()
+    if pattern in {"W", "DOUBLE_BOTTOM", "DOUBLE BOTTOM", "W_PATTERN", "W-PATTERN"}:
+        return "W"
+    if pattern in {"M", "DOUBLE_TOP", "DOUBLE TOP", "M_PATTERN", "M-PATTERN", "HEAD_AND_SHOULDERS", "HEAD AND SHOULDERS"}:
+        return "M"
+    if pattern in {"V", "V_PATTERN", "V-PATTERN"}:
+        return "V"
+    if pattern in {"TRIANGLE", "ASCENDING_TRIANGLE", "DESCENDING_TRIANGLE"}:
+        return "TRIANGLE"
+    side = str(signal.get("side", "")).upper()
+    if side == "BUY":
+        return "W"
+    if side == "SELL":
+        return "M"
+    return "TREND"
+
+
+def generate_trade_visualization(signal):
+    if plt is None:
+        raise RuntimeError("matplotlib is required to generate trade charts")
+
+    side = str(signal.get("side", "BUY")).upper()
+    entry = float(signal.get("entry", 0.0) or 0.0)
+    zone_low = float(signal.get("zone_low", entry) or entry)
+    zone_high = float(signal.get("zone_high", entry) or entry)
+    sl = float(signal.get("sl", min(zone_low, entry) - abs(zone_high - zone_low)) or 0.0)
+    tp1 = float(signal.get("tp1", entry) or entry)
+    tp2 = float(signal.get("tp2", entry) or entry)
+    tp3 = float(signal.get("tp3", entry) or entry)
+    symbol = str(signal.get("symbol", "PAIR"))
+    confidence = int(signal.get("confidence", 0) or 0)
+    structure = structure_label(signal)
+    pattern_name = structure if structure in {"W", "M", "V", "TRIANGLE"} else "TREND"
+
+    price_min = min(zone_low, entry, sl, tp1, tp2, tp3)
+    price_max = max(zone_high, entry, sl, tp1, tp2, tp3)
+    padding = max((price_max - price_min) * 0.22, 0.0005)
+    price_min -= padding
+    price_max += padding
+
+    fig, ax = plt.subplots(figsize=(8.2, 5.2))
+    fig.patch.set_facecolor("#0d1117")
+    ax.set_facecolor("#111827")
+
+    zone_x = [0.9, 4.8]
+    ax.axvspan(zone_x[0], zone_x[1], ymin=0, ymax=1, facecolor="#2dd4bf", alpha=0.12)
+
+    if side == "BUY":
+        x = [0.0, 1.2, 2.2, 3.2, 4.6]
+        y = [zone_high, zone_low + ((zone_high - zone_low) * 0.80), zone_high, entry, zone_high + ((price_max - price_min) * 0.04)]
+        ax.plot(x, y, color="#22c55e", linewidth=2.5)
+        ax.scatter([2.2], [entry], color="#4ade80", s=80, zorder=5)
+        ax.text(3.2, entry + (price_max - price_min) * 0.02, "W", fontsize=15, fontweight="bold", color="#86efac")
+    else:
+        x = [0.0, 1.2, 2.2, 3.2, 4.6]
+        y = [zone_low, zone_high - ((zone_high - zone_low) * 0.80), zone_low, entry, zone_low - ((price_max - price_min) * 0.04)]
+        ax.plot(x, y, color="#f87171", linewidth=2.5)
+        ax.scatter([2.2], [entry], color="#fca5a5", s=80, zorder=5)
+        ax.text(3.2, entry - (price_max - price_min) * 0.02, "M", fontsize=15, fontweight="bold", color="#fca5a5")
+
+    ax.axhline(entry, color="#a5f3fc", linestyle="--", linewidth=1.5, alpha=0.9, label="Entry")
+    ax.axhline(sl, color="#fca5a5", linestyle="-.", linewidth=1.3, label="SL")
+    ax.axhline(tp1, color="#86efac", linestyle=":", linewidth=1.3, label="TP1")
+    ax.axhline(tp2, color="#bef264", linestyle=":", linewidth=1.3, label="TP2")
+    ax.axhline(tp3, color="#fcd34d", linestyle=":", linewidth=1.3, label="TP3")
+
+    ax.fill_between([0.9, 4.8], zone_low, zone_high, color="#60a5fa", alpha=0.18)
+    ax.set_ylim(price_min, price_max)
+    ax.set_xlim(0.0, 5.0)
+    ax.set_xticks([])
+    ax.grid(True, alpha=0.18)
+    ax.set_title(f"{symbol} | {side} | {pattern_name} pattern | {confidence}% confidence", color="#e2e8f0", fontsize=12)
+    ax.set_ylabel("Price", color="#cbd5e1")
+    ax.tick_params(axis='y', colors="#cbd5e1")
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.spines["left"].set_color("#475569")
+    ax.spines["bottom"].set_color("#475569")
+
+    legend = ax.legend(loc="upper left", frameon=False, fontsize=8)
+    for text in legend.get_texts():
+        text.set_color("#e2e8f0")
+
+    ax.text(0.10, 0.02, f"Zone: {zone_low:.5f} – {zone_high:.5f}", transform=ax.transAxes, color="#cbd5e1", fontsize=8)
+    ax.text(0.55, 0.02, f"Trend = {signal.get('timeframe', 'H1')}", transform=ax.transAxes, color="#cbd5e1", fontsize=8)
+
+    buf = io.BytesIO()
+    fig.tight_layout()
+    fig.savefig(buf, format="png", dpi=180)
+    plt.close(fig)
+    return buf.getvalue()
+
+
+def telegram_send_chart(chat_id, signal):
+    if not TG_TOKEN:
+        return None
+    try:
+        chart = generate_trade_visualization(signal)
+    except RuntimeError:
+        return None
+    payload = {
+        "chat_id": chat_id,
+        "caption": (
+            f"{signal.get('symbol', 'PAIR')} | {signal.get('side', 'BUY')} | {structure_label(signal)} pattern\n"
+            f"Timeframe: {signal.get('timeframe', 'N/A')}\n"
+            f"Entry: {float(signal.get('entry') or 0):.5f}\n"
+            f"Zone: {float(signal.get('zone_low') or 0):.5f} - {float(signal.get('zone_high') or 0):.5f}\n"
+            f"SL/TP: {float(signal.get('sl') or 0):.5f} / {float(signal.get('tp3') or 0):.5f}"
+        )
+    }
+    files = {"photo": ("trade_structure.png", chart, "image/png")}
+    return requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto", data=payload, files=files, timeout=20)
+
+
+def send_self_test_message():
+    owner = owner_chat_id()
+    if not owner or not TG_TOKEN:
+        return {"ok": False, "reason": "telegram_owner_or_token_missing"}
+    sample = {
+        "symbol": "XAUUSD",
+        "side": "BUY",
+        "pattern": "W",
+        "entry": 2348.12,
+        "zone_low": 2344.60,
+        "zone_high": 2352.18,
+        "sl": 2339.20,
+        "tp1": 2356.00,
+        "tp2": 2360.50,
+        "tp3": 2364.20,
+        "risk_pct": 0.50,
+        "confidence": 82,
+        "analysis": "Self-test: monitor online, trend filter active, retest valid, risk gate armed.",
+        "timeframe": "M15",
+        "order_type": "LIMIT"
+    }
+    telegram("sendMessage", {
+        "chat_id": owner,
+        "text": "✅ Bot self-test OK. Monitor alive. Trend+retest+risk gate active.\n\n" + fmt(sample),
+        "parse_mode": "HTML",
+    })
+    telegram_send_chart(owner, sample)
+    return {"ok": True, "owner": owner, "message": "self-test-sent"}
+
+
 def fmt(s):
+    pattern = structure_label(s)
+    timeframe = str(s.get("timeframe", "N/A")).upper()
     return (f"{'🟢' if s['side'] == 'BUY' else '🔴'} <b>{s['symbol']} | {s['side']} {s['order_type']}</b>\n"
+            f"Structure: <b>{pattern}</b> | Timeframe: <b>{timeframe}</b>\n"
             f"AI / rules confidence: <b>{s['confidence']}%</b>\n\n"
             f"Entry zone: <code>{s['zone_low']:.5f} – {s['zone_high']:.5f}</code>\n"
             f"Order entry: <code>{s['entry']:.5f}</code>\n"
@@ -148,6 +304,7 @@ def tradingview_webhook():
         "sl": float(data["sl"]), "tp1": float(data["tp1"]), "tp2": float(data["tp2"]), "tp3": float(data["tp3"]),
         "risk_pct": float(data.get("risk_pct", os.getenv("DEFAULT_RISK_PERCENT", "0.5"))),
         "confidence": int(data.get("confidence", 0)),
+        "pattern": str(data.get("pattern", structure_label({"side": data.get("side", "BUY")}))),
         "analysis": str(data.get("analysis", "Trend + RSI + MACD + zone alignment")),
         "timeframe": str(data.get("timeframe", "")), "price": data.get("price"), "ema_fast": data.get("ema_fast"),
         "ema_slow": data.get("ema_slow"), "rsi": data.get("rsi"), "macd": data.get("macd"),
@@ -157,7 +314,7 @@ def tradingview_webhook():
     if not accepted: return jsonify(ok=True, sent=False, reason="Signal filtered: " + review)
     signal["confidence"], signal["analysis"] = final_confidence, review
     with db() as con:
-        con.execute("INSERT INTO signals VALUES (:id,:created_at,:symbol,:side,:order_type,:entry,:zone_low,:zone_high,:sl,:tp1,:tp2,:tp3,:risk_pct,:confidence,:analysis,'pending')", signal)
+        con.execute("INSERT INTO signals (id, created_at, symbol, side, order_type, entry, zone_low, zone_high, sl, tp1, tp2, tp3, risk_pct, confidence, pattern, timeframe, analysis, status) VALUES (:id,:created_at,:symbol,:side,:order_type,:entry,:zone_low,:zone_high,:sl,:tp1,:tp2,:tp3,:risk_pct,:confidence,:pattern,:timeframe,:analysis,'pending')", signal)
     owner = owner_chat_id()
     if not owner: return jsonify(error="Telegram owner missing: send /start to the bot first"), 503
     keyboard = {"inline_keyboard": [[
@@ -165,6 +322,7 @@ def tradingview_webhook():
         {"text": "❌ Rad etish", "callback_data": f"reject:{signal_id}"}],
         [{"text": "📊 Batafsil tahlil", "callback_data": f"detail:{signal_id}"}]]}
     telegram("sendMessage", {"chat_id": owner, "text": fmt(signal), "parse_mode": "HTML", "reply_markup": keyboard})
+    telegram_send_chart(owner, signal)
     return jsonify(ok=True, id=signal_id)
 
 @app.post("/telegram/webhook")
@@ -194,6 +352,8 @@ def telegram_webhook():
         msg = fmt(signal) if action == "detail" else ("✅ Tasdiqlandi. MT5 EA orderni tekshiradi." if action == "approve" else "❌ Signal rad etildi.")
     telegram("answerCallbackQuery", {"callback_query_id": query["id"], "text": "Qabul qilindi"})
     telegram("sendMessage", {"chat_id": owner_chat_id(), "text": msg, "parse_mode": "HTML"})
+    if action in ("approve", "reject", "detail"):
+        telegram_send_chart(owner_chat_id(), signal)
     return "ok"
 
 @app.get("/mt5/next")
@@ -220,9 +380,37 @@ def mt5_ack(signal_id):
 def health():
     return jsonify(ok=True, telegram_configured=bool(TG_TOKEN), owner_configured=bool(owner_chat_id()), openai_configured=bool(OPENAI_KEY), gemini_configured=bool(GEMINI_KEY))
 
+@app.get("/selftest")
+def selftest():
+    result = send_self_test_message()
+    return jsonify(result)
+
+@app.get("/mt5/test")
+def mt5_test():
+    if not APP_KEY or not secrets.compare_digest(request.headers.get("X-Api-Key", ""), APP_KEY):
+        abort(401)
+    return Response("OK|monitor|alive|" + datetime.now(timezone.utc).isoformat(), mimetype="text/plain")
+
 @app.get("/")
 def index():
     return jsonify(service="AI Zone Trader", health="/health", status="running")
+
+@app.get("/chart")
+def chart():
+    sample = {
+        "symbol": "EURUSD",
+        "side": "BUY",
+        "entry": 1.0925,
+        "zone_low": 1.0890,
+        "zone_high": 1.0940,
+        "sl": 1.0850,
+        "tp1": 1.0995,
+        "tp2": 1.1045,
+        "tp3": 1.1090,
+        "confidence": 82,
+        "timeframe": "H1",
+    }
+    return Response(generate_trade_visualization(sample), mimetype="image/png")
 
 if __name__ == "__main__":
     init_db()
