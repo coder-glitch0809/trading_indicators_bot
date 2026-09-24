@@ -6,7 +6,8 @@ import secrets
 import sqlite3
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 
 import requests
 from dotenv import load_dotenv
@@ -34,30 +35,67 @@ TV_SECRET = os.environ.get("TV_WEBHOOK_SECRET", "")
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
 OPENAI_KEY = os.environ.get("OPENAI_API_KEY_1", "")
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
+CLAUDE_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 AI_ENABLED = os.getenv("AI_ENABLED", "false").lower() == "true"
 AI_REQUIRED = os.getenv("AI_REQUIRED", "true").lower() == "true"
+CLAUDE_ENABLED = os.getenv("CLAUDE_ENABLED", "true").lower() == "true"
 AI_MIN_CONFIDENCE = int(os.getenv("AI_MIN_CONFIDENCE", "70"))
+SIGNAL_TTL_MINUTES = max(1, int(os.getenv("SIGNAL_TTL_MINUTES", "30")))
+MIN_RISK_REWARD = max(0.1, float(os.getenv("MIN_RISK_REWARD", "1.2")))
 OPENAI_MODEL = os.getenv("OPENAI_MODEL_1", "gpt-5-mini")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514")
+CLAUDE_API_URL = os.getenv("CLAUDE_API_URL", "https://api.anthropic.com/v1/messages")
 VERDICT_SCHEMA = {"type": "object", "additionalProperties": False, "properties": {
     "approve": {"type": "boolean"}, "confidence": {"type": "integer", "minimum": 0, "maximum": 100},
     "reason": {"type": "string", "maxLength": 180}, "risk_flag": {"type": "string", "maxLength": 120},
 }, "required": ["approve", "confidence", "reason", "risk_flag"]}
 
+@contextmanager
 def db():
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
-    return con
+    try:
+        yield con
+        con.commit()
+    finally:
+        con.close()
 
 def init_db():
     with db() as con:
         con.execute("""CREATE TABLE IF NOT EXISTS signals (
           id TEXT PRIMARY KEY, created_at TEXT, symbol TEXT, side TEXT, order_type TEXT,
           entry REAL, zone_low REAL, zone_high REAL, sl REAL, tp1 REAL, tp2 REAL, tp3 REAL,
-          risk_pct REAL, confidence INTEGER, pattern TEXT, timeframe TEXT, analysis TEXT, status TEXT DEFAULT 'pending')""")
+          risk_pct REAL, confidence INTEGER, pattern TEXT, timeframe TEXT, strategy TEXT,
+          expires_at TEXT, analysis TEXT, status TEXT DEFAULT 'pending')""")
         con.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        con.execute("""CREATE TABLE IF NOT EXISTS signal_events (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, signal_id TEXT, created_at TEXT,
+          event TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '')""")
+        columns = {row["name"] for row in con.execute("PRAGMA table_info(signals)")}
+        for name, definition in (("pattern", "TEXT"), ("timeframe", "TEXT"),
+                                 ("strategy", "TEXT"), ("expires_at", "TEXT")):
+            if name not in columns:
+                con.execute(f"ALTER TABLE signals ADD COLUMN {name} {definition}")
         if OWNER_CHAT_ID:
             con.execute("INSERT OR IGNORE INTO settings(key,value) VALUES ('owner_chat_id',?)", (OWNER_CHAT_ID,))
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+def log_event(con, signal_id, event, detail=""):
+    con.execute("INSERT INTO signal_events(signal_id,created_at,event,detail) VALUES (?,?,?,?)",
+                (signal_id, now_iso(), event, str(detail)[:500]))
+
+def setting(key, default=""):
+    with db() as con:
+        row = con.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    return row["value"] if row else default
+
+def set_setting(key, value):
+    with db() as con:
+        con.execute("INSERT INTO settings(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (key, str(value)))
 
 def telegram(method, payload):
     if not TG_TOKEN:
@@ -67,9 +105,12 @@ def telegram(method, payload):
 def configure_telegram_webhook():
     if not TG_TOKEN or not PUBLIC_BASE_URL:
         return
-    response = telegram("setWebhook", {"url": PUBLIC_BASE_URL + "/telegram/webhook", "allowed_updates": ["message", "callback_query"]})
-    if not response.ok:
-        print("Telegram webhook setup failed:", response.text[:250])
+    try:
+        response = telegram("setWebhook", {"url": PUBLIC_BASE_URL + "/telegram/webhook", "allowed_updates": ["message", "callback_query"]})
+        if not response.ok:
+            print("Telegram webhook setup failed:", response.text[:250])
+    except requests.RequestException as exc:
+        print("Telegram webhook setup unavailable:", str(exc)[:160])
 
 def require_owner(chat_id):
     return bool(owner_chat_id()) and str(chat_id) == owner_chat_id()
@@ -92,34 +133,74 @@ def _response_text(body):
                 return content.get("text", "")
     raise ValueError("OpenAI response contained no output text")
 
+def signal_facts(signal):
+    return {k: signal.get(k) for k in ("symbol", "side", "order_type", "entry", "zone_low", "zone_high",
+                                       "sl", "tp1", "tp2", "tp3", "confidence", "timeframe", "price",
+                                       "ema_fast", "ema_slow", "rsi", "macd", "macd_signal", "atr")}
+
+def parse_verdict(text):
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+    verdict = json.loads(text)
+    if not isinstance(verdict.get("approve"), bool) or not isinstance(verdict.get("confidence"), int):
+        raise ValueError("AI verdict has an invalid schema")
+    if not 0 <= verdict["confidence"] <= 100:
+        raise ValueError("AI confidence is outside 0-100")
+    for key in ("reason", "risk_flag"):
+        if not isinstance(verdict.get(key), str):
+            raise ValueError("AI verdict has an invalid schema")
+    return verdict
+
 def ai_review(signal, role, key, model):
-    facts = {k: signal.get(k) for k in ("symbol", "side", "order_type", "entry", "zone_low", "zone_high", "sl", "tp1", "tp2", "tp3", "confidence", "timeframe", "price", "ema_fast", "ema_slow", "rsi", "macd", "macd_signal", "atr")}
-    instructions = (f"You are the {role} in a two-agent trade-review system. Assess only supplied indicator facts. "
+    facts = signal_facts(signal)
+    instructions = (f"You are the {role} in a multi-agent trade-review system. Assess only supplied indicator facts. "
                     "Do not invent prices/history or claim certainty. Reject inconsistent trend, SL, entry-zone or reward/risk logic.")
     payload = {"model": model, "store": False, "instructions": instructions, "input": json.dumps(facts, separators=(",", ":")),
                "text": {"format": {"type": "json_schema", "name": "trade_review", "strict": True, "schema": VERDICT_SCHEMA}}}
     response = requests.post("https://api.openai.com/v1/responses", headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"}, json=payload, timeout=25)
     response.raise_for_status()
-    return json.loads(_response_text(response.json()))
+    return parse_verdict(_response_text(response.json()))
 
 def gemini_review(signal):
-    facts = {k: signal.get(k) for k in ("symbol", "side", "order_type", "entry", "zone_low", "zone_high", "sl", "tp1", "tp2", "tp3", "confidence", "timeframe", "price", "ema_fast", "ema_slow", "rsi", "macd", "macd_signal", "atr")}
+    facts = signal_facts(signal)
     prompt = ("You are the risk auditor in a trade-review system. Assess only supplied indicator facts. Do not invent history or claim certainty. Reject inconsistent trend, SL, entry-zone or reward/risk logic. Return JSON.\n" + json.dumps(facts, separators=(",", ":")))
     payload = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"responseMimeType": "application/json", "responseJsonSchema": VERDICT_SCHEMA}}
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
     response = requests.post(url, headers={"x-goog-api-key": GEMINI_KEY, "Content-Type": "application/json"}, json=payload, timeout=25)
     response.raise_for_status()
-    return json.loads(response.json()["candidates"][0]["content"]["parts"][0]["text"])
+    return parse_verdict(response.json()["candidates"][0]["content"]["parts"][0]["text"])
+
+def claude_review(signal):
+    facts = signal_facts(signal)
+    system = ("You are the independent risk auditor in a multi-agent trade-review system. "
+              "Assess only supplied indicator facts. Do not invent prices, history, news, or certainty. "
+              "Reject inconsistent trend, SL, entry-zone or reward/risk logic. Return only valid JSON matching "
+              '{"approve":boolean,"confidence":integer,"reason":string,"risk_flag":string}.')
+    payload = {
+        "model": CLAUDE_MODEL,
+        "max_tokens": 300,
+        "temperature": 0,
+        "system": system,
+        "messages": [{"role": "user", "content": json.dumps(facts, separators=(",", ":"))}],
+    }
+    headers = {"x-api-key": CLAUDE_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}
+    response = requests.post(CLAUDE_API_URL, headers=headers, json=payload, timeout=25)
+    response.raise_for_status()
+    return parse_verdict(response.json()["content"][0]["text"])
 
 def consensus(signal):
-    """Both roles must approve; unavailable AI fails closed when AI_REQUIRED is true."""
+    """Every configured AI reviewer must approve; required AI failures fail closed."""
     if not AI_ENABLED: return True, int(signal.get("confidence", 0)), "Rules-only: AI disabled"
     if not OPENAI_KEY or not GEMINI_KEY: return (not AI_REQUIRED), 0, "AI blocked: OpenAI and Gemini keys are required"
     try:
-        with ThreadPoolExecutor(max_workers=2) as pool:
+        with ThreadPoolExecutor(max_workers=3) as pool:
             openai = pool.submit(ai_review, signal, "technical analyst", OPENAI_KEY, OPENAI_MODEL)
             gemini = pool.submit(gemini_review, signal)
-            reviews = [openai.result(), gemini.result()]
+            futures = [openai, gemini]
+            if CLAUDE_ENABLED and CLAUDE_KEY:
+                futures.append(pool.submit(claude_review, signal))
+            reviews = [future.result() for future in futures]
     except Exception as exc: return (not AI_REQUIRED), 0, "AI unavailable: " + str(exc)[:100]
     ai_score = round(sum(r["confidence"] for r in reviews) / len(reviews))
     score = round((int(signal.get("confidence", 0)) + ai_score) / 2)
@@ -287,6 +368,43 @@ def fmt(s):
             f"Risk: <b>{s['risk_pct']:.2f}%</b> | expires when market conditions change\n"
             f"Reason: {s['analysis']}")
 
+def validate_trade(signal):
+    entry, sl, tp1, tp2, tp3 = (signal[key] for key in ("entry", "sl", "tp1", "tp2", "tp3"))
+    zone_low, zone_high = signal["zone_low"], signal["zone_high"]
+    if zone_low > zone_high:
+        return "zone_low must not exceed zone_high"
+    if not zone_low <= entry <= zone_high:
+        return "entry must be inside the supplied zone"
+    risk = abs(entry - sl)
+    if risk <= 0:
+        return "stop loss must differ from entry"
+    if signal["side"] == "BUY":
+        if not (sl < entry < tp1 <= tp2 <= tp3):
+            return "BUY requires SL < entry < TP1 <= TP2 <= TP3"
+        reward = tp1 - entry
+    else:
+        if not (sl > entry > tp1 >= tp2 >= tp3):
+            return "SELL requires SL > entry > TP1 >= TP2 >= TP3"
+        reward = entry - tp1
+    if reward / risk < MIN_RISK_REWARD:
+        return f"TP1 risk/reward must be at least {MIN_RISK_REWARD:g}"
+    if not 0 < signal["risk_pct"] <= 100:
+        return "risk_pct must be between 0 and 100"
+    return ""
+
+def expire_signals(con):
+    con.execute("UPDATE signals SET status='expired' WHERE status IN ('pending','approved') "
+                "AND expires_at IS NOT NULL AND expires_at <= ?", (now_iso(),))
+
+def news_blocked():
+    value = setting("news_block_until", "")
+    if not value:
+        return False
+    try:
+        return datetime.fromisoformat(value) > datetime.now(timezone.utc)
+    except ValueError:
+        return False
+
 @app.post("/tradingview/webhook")
 def tradingview_webhook():
     data = request.get_json(silent=True) or {}
@@ -296,25 +414,42 @@ def tradingview_webhook():
     if any(k not in data for k in required) or data["side"] not in ("BUY", "SELL"):
         return jsonify(error="invalid payload"), 400
     signal_id = secrets.token_urlsafe(10)
-    signal = {
-        "id": signal_id, "created_at": datetime.now(timezone.utc).isoformat(),
+    try:
+        risk_pct = float(data.get("risk_pct", setting("risk_pct", os.getenv("DEFAULT_RISK_PERCENT", "0.5"))))
+        signal = {
+        "id": signal_id, "created_at": now_iso(),
         "symbol": str(data["symbol"]), "side": data["side"],
         "order_type": data.get("order_type", "LIMIT"), "entry": float(data["entry"]),
         "zone_low": float(data["zone_low"]), "zone_high": float(data["zone_high"]),
         "sl": float(data["sl"]), "tp1": float(data["tp1"]), "tp2": float(data["tp2"]), "tp3": float(data["tp3"]),
-        "risk_pct": float(data.get("risk_pct", os.getenv("DEFAULT_RISK_PERCENT", "0.5"))),
+        "risk_pct": risk_pct,
         "confidence": int(data.get("confidence", 0)),
         "pattern": str(data.get("pattern", structure_label({"side": data.get("side", "BUY")}))),
+        "strategy": str(data.get("strategy", "TRENDLINE")).upper(),
+        "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=SIGNAL_TTL_MINUTES)).isoformat(),
         "analysis": str(data.get("analysis", "Trend + RSI + MACD + zone alignment")),
         "timeframe": str(data.get("timeframe", "")), "price": data.get("price"), "ema_fast": data.get("ema_fast"),
         "ema_slow": data.get("ema_slow"), "rsi": data.get("rsi"), "macd": data.get("macd"),
         "macd_signal": data.get("macd_signal"), "atr": data.get("atr"),
-    }
+        }
+    except (TypeError, ValueError):
+        return jsonify(error="numeric payload fields are invalid"), 400
+    validation_error = validate_trade(signal)
+    if validation_error:
+        return jsonify(error=validation_error), 400
+    if setting("trading_paused", "false") == "true":
+        return jsonify(ok=True, sent=False, reason="Trading is paused")
+    if news_blocked():
+        return jsonify(ok=True, sent=False, reason="Trading is paused for high-impact news")
     accepted, final_confidence, review = consensus(signal)
-    if not accepted: return jsonify(ok=True, sent=False, reason="Signal filtered: " + review)
+    if not accepted:
+        with db() as con:
+            log_event(con, signal_id, "filtered", review)
+        return jsonify(ok=True, sent=False, reason="Signal filtered: " + review)
     signal["confidence"], signal["analysis"] = final_confidence, review
     with db() as con:
-        con.execute("INSERT INTO signals (id, created_at, symbol, side, order_type, entry, zone_low, zone_high, sl, tp1, tp2, tp3, risk_pct, confidence, pattern, timeframe, analysis, status) VALUES (:id,:created_at,:symbol,:side,:order_type,:entry,:zone_low,:zone_high,:sl,:tp1,:tp2,:tp3,:risk_pct,:confidence,:pattern,:timeframe,:analysis,'pending')", signal)
+        con.execute("INSERT INTO signals (id, created_at, symbol, side, order_type, entry, zone_low, zone_high, sl, tp1, tp2, tp3, risk_pct, confidence, pattern, timeframe, strategy, expires_at, analysis, status) VALUES (:id,:created_at,:symbol,:side,:order_type,:entry,:zone_low,:zone_high,:sl,:tp1,:tp2,:tp3,:risk_pct,:confidence,:pattern,:timeframe,:strategy,:expires_at,:analysis,'pending')", signal)
+        log_event(con, signal_id, "created", signal["strategy"])
     owner = owner_chat_id()
     if not owner: return jsonify(error="Telegram owner missing: send /start to the bot first"), 503
     keyboard = {"inline_keyboard": [[
@@ -329,18 +464,62 @@ def tradingview_webhook():
 def telegram_webhook():
     update = request.get_json(silent=True) or {}
     message = update.get("message") or {}
-    if message.get("text", "").strip().startswith("/start"):
-        chat_id = message.get("chat", {}).get("id")
+    chat_id = message.get("chat", {}).get("id")
+    command = message.get("text", "").strip()
+    if command.startswith("/start"):
         if chat_id and claim_owner(chat_id):
-            telegram("sendMessage", {"chat_id": chat_id, "text": "Bot connected. You are the only user who can confirm signals."})
+            telegram("sendMessage", {"chat_id": chat_id, "text": "Bot connected. Commands: /status, /pause, /resume, /risk 0.5, /newsblock 30, /newsresume"})
         elif chat_id:
             telegram("sendMessage", {"chat_id": chat_id, "text": "This bot is already linked to another owner."})
+        return "ok"
+    if command and require_owner(chat_id):
+        if command == "/pause":
+            set_setting("trading_paused", "true")
+            telegram("sendMessage", {"chat_id": chat_id, "text": "Trading paused. New signals will be rejected."})
+        elif command == "/resume":
+            set_setting("trading_paused", "false")
+            telegram("sendMessage", {"chat_id": chat_id, "text": "Trading resumed."})
+        elif command.startswith("/risk"):
+            parts = command.split(maxsplit=1)
+            try:
+                risk = float(parts[1])
+                if not 0.01 <= risk <= 5:
+                    raise ValueError
+            except (IndexError, ValueError):
+                telegram("sendMessage", {"chat_id": chat_id, "text": "Usage: /risk 0.5 (allowed: 0.01 to 5)"})
+            else:
+                set_setting("risk_pct", risk)
+                telegram("sendMessage", {"chat_id": chat_id, "text": f"Default risk set to {risk:.2f}%."})
+        elif command.startswith("/newsblock"):
+            parts = command.split(maxsplit=1)
+            try:
+                minutes = int(parts[1])
+                if not 1 <= minutes <= 480:
+                    raise ValueError
+            except (IndexError, ValueError):
+                telegram("sendMessage", {"chat_id": chat_id, "text": "Usage: /newsblock 30 (1 to 480 minutes)"})
+            else:
+                until = (datetime.now(timezone.utc) + timedelta(minutes=minutes)).isoformat()
+                set_setting("news_block_until", until)
+                telegram("sendMessage", {"chat_id": chat_id, "text": f"News safety block enabled for {minutes} minutes."})
+        elif command == "/newsresume":
+            set_setting("news_block_until", "")
+            telegram("sendMessage", {"chat_id": chat_id, "text": "News safety block cleared."})
+        elif command == "/status":
+            with db() as con:
+                expire_signals(con)
+                rows = con.execute("SELECT status, COUNT(*) AS count FROM signals GROUP BY status").fetchall()
+            counts = ", ".join(f"{row['status']}: {row['count']}" for row in rows) or "no signals"
+            paused = setting("trading_paused", "false") == "true"
+            mode = "NEWS BLOCK" if news_blocked() else "PAUSED" if paused else "ACTIVE"
+            telegram("sendMessage", {"chat_id": chat_id, "text": f"Trading: {mode}\n{counts}"})
         return "ok"
     query = update.get("callback_query")
     if not query or not require_owner(query.get("message", {}).get("chat", {}).get("id")):
         return "ok"
     action, signal_id = query.get("data", ":").split(":", 1)
     with db() as con:
+        expire_signals(con)
         row = con.execute("SELECT * FROM signals WHERE id=?", (signal_id,)).fetchone()
         if not row:
             telegram("answerCallbackQuery", {"callback_query_id": query["id"], "text": "Signal topilmadi"})
@@ -349,7 +528,12 @@ def telegram_webhook():
         status = "approved" if action == "approve" else "rejected" if action == "reject" else signal["status"]
         if action in ("approve", "reject") and signal["status"] == "pending":
             con.execute("UPDATE signals SET status=? WHERE id=?", (status, signal_id))
+            log_event(con, signal_id, status, "telegram")
         msg = fmt(signal) if action == "detail" else ("✅ Tasdiqlandi. MT5 EA orderni tekshiradi." if action == "approve" else "❌ Signal rad etildi.")
+    if action == "approve" and signal["status"] == "expired":
+        msg = "Signal expired; it cannot be approved."
+    elif action in ("approve", "reject") and signal["status"] != "pending":
+        msg = "This signal was already processed."
     telegram("answerCallbackQuery", {"callback_query_id": query["id"], "text": "Qabul qilindi"})
     telegram("sendMessage", {"chat_id": owner_chat_id(), "text": msg, "parse_mode": "HTML"})
     if action in ("approve", "reject", "detail"):
@@ -361,24 +545,47 @@ def mt5_next():
     if not APP_KEY or not secrets.compare_digest(request.headers.get("X-Api-Key", ""), APP_KEY):
         abort(401)
     with db() as con:
+        expire_signals(con)
         row = con.execute("SELECT * FROM signals WHERE status='approved' ORDER BY created_at LIMIT 1").fetchone()
         if not row:
             return Response("NONE", mimetype="text/plain")
         s = dict(row)
     # Delimiter format keeps MQL parsing dependency-free.
-    return Response("OPEN|{id}|{symbol}|{side}|{order_type}|{entry}|{sl}|{tp1}|{tp2}|{tp3}|{risk_pct}".format(**s), mimetype="text/plain")
+    return Response("OPEN|{id}|{symbol}|{side}|{order_type}|{entry}|{sl}|{tp1}|{tp2}|{tp3}|{risk_pct}|{strategy}".format(**s), mimetype="text/plain")
 
 @app.post("/mt5/ack/<signal_id>")
 def mt5_ack(signal_id):
     if not APP_KEY or not secrets.compare_digest(request.headers.get("X-Api-Key", ""), APP_KEY):
         abort(401)
     with db() as con:
-        con.execute("UPDATE signals SET status='sent_to_mt5' WHERE id=? AND status='approved'", (signal_id,))
+        result = con.execute("UPDATE signals SET status='sent_to_mt5' WHERE id=? AND status='approved'", (signal_id,))
+        if result.rowcount:
+            log_event(con, signal_id, "sent_to_mt5", "acknowledged by EA")
     return jsonify(ok=True)
 
 @app.get("/health")
 def health():
-    return jsonify(ok=True, telegram_configured=bool(TG_TOKEN), owner_configured=bool(owner_chat_id()), openai_configured=bool(OPENAI_KEY), gemini_configured=bool(GEMINI_KEY))
+    return jsonify(ok=True, telegram_configured=bool(TG_TOKEN), owner_configured=bool(owner_chat_id()),
+                   openai_configured=bool(OPENAI_KEY), gemini_configured=bool(GEMINI_KEY),
+                   claude_configured=bool(CLAUDE_KEY), claude_enabled=CLAUDE_ENABLED)
+
+@app.get("/dashboard")
+def dashboard():
+    if not APP_KEY or not secrets.compare_digest(request.headers.get("X-Api-Key", ""), APP_KEY):
+        abort(401)
+    with db() as con:
+        expire_signals(con)
+        counts = {row["status"]: row["count"] for row in con.execute(
+            "SELECT status, COUNT(*) AS count FROM signals GROUP BY status")}
+        recent = [dict(row) for row in con.execute(
+            "SELECT id, created_at, symbol, side, strategy, confidence, expires_at, status "
+            "FROM signals ORDER BY created_at DESC LIMIT 20")]
+        events = [dict(row) for row in con.execute(
+            "SELECT signal_id, created_at, event, detail FROM signal_events ORDER BY id DESC LIMIT 30")]
+    return jsonify(trading_paused=setting("trading_paused", "false") == "true",
+                   news_blocked=news_blocked(), news_block_until=setting("news_block_until", ""),
+                   default_risk_pct=float(setting("risk_pct", os.getenv("DEFAULT_RISK_PERCENT", "0.5"))),
+                   status_counts=counts, recent_signals=recent, recent_events=events)
 
 @app.get("/selftest")
 def selftest():
@@ -419,4 +626,5 @@ if __name__ == "__main__":
 else:
     # Vercel imports the Flask app instead of running this file as __main__.
     init_db()
-    configure_telegram_webhook()
+    if os.getenv("AUTO_CONFIGURE_TELEGRAM_WEBHOOK", "false").lower() == "true":
+        configure_telegram_webhook()

@@ -12,6 +12,7 @@ rr1           = input.float(1.2, "TP1 R multiple", minval=0.5)
 rr2           = input.float(2.0, "TP2 R multiple", minval=1.0)
 rr3           = input.float(3.0, "TP3 R multiple", minval=1.5)
 riskPct       = input.float(0.5, "Risk % suggested", minval=0.1, maxval=2.0, step=0.1)
+strategyType  = input.string("TRENDLINE", "MT5 strategy", options=["TRENDLINE", "SCALP", "SWING", "SNIPER", "FVG", "MIXED"])
 webhookSecret = input.string("CHANGE_ME", "Webhook secret", confirm=true)
 alertsEnabled = input.bool(true, "Enable webhook alerts")
 
@@ -72,7 +73,7 @@ confidenceShort = math.round((downTrend ? 35 : 0) + (rsi < 50 ? 20 : 0) + (macdL
 
 f_num(x) => str.tostring(x, format.mintick)
 f_payload(side, orderType, entry, zLow, zHigh, sl, tp1, tp2, tp3, confidence) =>
-    '{"secret":"' + webhookSecret + '","symbol":"' + syminfo.ticker + '","timeframe":"' + timeframe.period + '","side":"' + side + '","order_type":"' + orderType + '","pattern":"' + patternType + '","price":' + f_num(close) + ',"entry":' + f_num(entry) + ',"zone_low":' + f_num(zLow) + ',"zone_high":' + f_num(zHigh) + ',"sl":' + f_num(sl) + ',"tp1":' + f_num(tp1) + ',"tp2":' + f_num(tp2) + ',"tp3":' + f_num(tp3) + ',"ema_fast":' + f_num(emaFast) + ',"ema_slow":' + f_num(emaSlow) + ',"rsi":' + str.tostring(rsi) + ',"macd":' + str.tostring(macdLine) + ',"macd_signal":' + str.tostring(signalLine) + ',"atr":' + f_num(atr) + ',"risk_pct":' + str.tostring(riskPct) + ',"confidence":' + str.tostring(confidence) + ',"analysis":"EMA trend + RSI + MACD + pivot zone"}'
+    '{"secret":"' + webhookSecret + '","symbol":"' + syminfo.ticker + '","timeframe":"' + timeframe.period + '","side":"' + side + '","order_type":"' + orderType + '","pattern":"' + patternType + '","strategy":"' + strategyType + '","price":' + f_num(close) + ',"entry":' + f_num(entry) + ',"zone_low":' + f_num(zLow) + ',"zone_high":' + f_num(zHigh) + ',"sl":' + f_num(sl) + ',"tp1":' + f_num(tp1) + ',"tp2":' + f_num(tp2) + ',"tp3":' + f_num(tp3) + ',"ema_fast":' + f_num(emaFast) + ',"ema_slow":' + f_num(emaSlow) + ',"rsi":' + str.tostring(rsi) + ',"macd":' + str.tostring(macdLine) + ',"macd_signal":' + str.tostring(signalLine) + ',"atr":' + f_num(atr) + ',"risk_pct":' + str.tostring(riskPct) + ',"confidence":' + str.tostring(confidence) + ',"analysis":"EMA trend + RSI + MACD + pivot zone"}'
 
 if longSetup and alertsEnabled
     alert(f_payload("BUY", "LIMIT", longEntry, demandLow, demandHigh, longSL, longTP1, longTP2, longTP3, confidenceLong), alert.freq_once_per_bar_close)

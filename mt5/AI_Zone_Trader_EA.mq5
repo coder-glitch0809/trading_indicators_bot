@@ -10,9 +10,14 @@ input string ServerUrl = "https://server-xi-rose-97.vercel.app/";
 input string ApiKey = "mt5_mql5_secret_key";
 input string SymbolOverride = "";              // e.g. XAUUSD.a; blank = current chart
 input double MaxRiskPercent = 0.50;
+input double MaxTotalRiskPercent = 1.50;
+input double MaxDailyLossPercent = 2.00;
+input int MaxConsecutiveLosses = 3;
 input int PollSeconds = 10;
 input ulong MagicNumber = 260916;
 input int SlippagePoints = 30;
+input double MinRiskReward = 1.20;
+input int SelfTestMinutes = 15;
 input int TrendLookback = 40;
 input int ConfirmationBars = 2;
 input double MaxSpreadPoints = 18.0;
@@ -26,11 +31,13 @@ input bool EnableSniper = true;
 input bool AutoDrawStructure = true;
 
 CTrade trade;
+datetime LastSelfTest = 0;
 
 string ActiveSymbol() { return SymbolOverride == "" ? _Symbol : SymbolOverride; }
 
 string NormalizeStrategy(string str) {
-   string s = StringUpper(str);
+   string s = str;
+   StringToUpper(s);
    if(s=="SCALP" || s=="SCALPING") return "SCALP";
    if(s=="SWING") return "SWING";
    if(s=="SNIPER") return "SNIPER";
@@ -82,15 +89,84 @@ void Acknowledge(string id) {
 bool IsMarketSafe(string symbol) {
    MqlTick tick;
    if(!SymbolInfoTick(symbol,tick)) return false;
-   double spread = (tick.ask - tick.bid) / _Point;
+   double point=SymbolInfoDouble(symbol,SYMBOL_POINT);
+   if(point<=0) return false;
+   double spread = (tick.ask - tick.bid) / point;
    if(spread > MaxSpreadPoints) return false;
    double equity = AccountInfoDouble(ACCOUNT_EQUITY);
    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
    if(balance <= 0.0) return false;
    double drawdown = ((balance - equity) / balance) * 100.0;
    if(drawdown > MaxDrawdownPercent) return false;
+   if(!DailyRiskIsSafe()) return false;
    if(PositionsTotal() >= MaxOpenPositions) return false;
    return true;
+}
+
+bool DailyRiskIsSafe() {
+   datetime dayStart=StringToTime(TimeToString(TimeCurrent(),TIME_DATE));
+   if(!HistorySelect(dayStart,TimeCurrent())) return false;
+   double dailyLoss=0;
+   int consecutiveLosses=0;
+   for(int i=HistoryDealsTotal()-1;i>=0;i--) {
+      ulong ticket=HistoryDealGetTicket(i);
+      if(ticket==0 || (ulong)HistoryDealGetInteger(ticket,DEAL_MAGIC)!=MagicNumber) continue;
+      long entry=HistoryDealGetInteger(ticket,DEAL_ENTRY);
+      if(entry!=DEAL_ENTRY_OUT && entry!=DEAL_ENTRY_OUT_BY) continue;
+      double pnl=HistoryDealGetDouble(ticket,DEAL_PROFIT)+HistoryDealGetDouble(ticket,DEAL_SWAP)+HistoryDealGetDouble(ticket,DEAL_COMMISSION);
+      if(pnl<0) {
+         dailyLoss-=pnl;
+         consecutiveLosses++;
+         if(consecutiveLosses>=MaxConsecutiveLosses) { Print("Consecutive loss limit reached."); return false; }
+      }
+      else if(pnl>0) consecutiveLosses=0;
+   }
+   double balance=AccountInfoDouble(ACCOUNT_BALANCE);
+   if(balance<=0) return false;
+   if(dailyLoss/balance*100.0>=MaxDailyLossPercent) { Print("Daily loss limit reached."); return false; }
+   return true;
+}
+
+double ExistingRiskMoney() {
+   double risk=0;
+   for(int i=PositionsTotal()-1;i>=0;i--) {
+      ulong ticket=PositionGetTicket(i); if(ticket==0 || (ulong)PositionGetInteger(POSITION_MAGIC)!=MagicNumber) continue;
+      double sl=PositionGetDouble(POSITION_SL); if(sl<=0) return DBL_MAX;
+      double loss=0; string symbol=PositionGetString(POSITION_SYMBOL);
+      ENUM_ORDER_TYPE type=(PositionGetInteger(POSITION_TYPE)==POSITION_TYPE_BUY ? ORDER_TYPE_BUY : ORDER_TYPE_SELL);
+      if(!OrderCalcProfit(type,symbol,PositionGetDouble(POSITION_VOLUME),PositionGetDouble(POSITION_PRICE_OPEN),sl,loss)) return DBL_MAX;
+      risk+=MathAbs(loss);
+   }
+   for(int i=OrdersTotal()-1;i>=0;i--) {
+      ulong ticket=OrderGetTicket(i); if(ticket==0 || (ulong)OrderGetInteger(ORDER_MAGIC)!=MagicNumber) continue;
+      ENUM_ORDER_TYPE type=(ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+      if(type!=ORDER_TYPE_BUY_LIMIT && type!=ORDER_TYPE_SELL_LIMIT) continue;
+      double sl=OrderGetDouble(ORDER_SL); if(sl<=0) return DBL_MAX;
+      double loss=0; string symbol=OrderGetString(ORDER_SYMBOL);
+      ENUM_ORDER_TYPE calcType=(type==ORDER_TYPE_BUY_LIMIT ? ORDER_TYPE_BUY : ORDER_TYPE_SELL);
+      if(!OrderCalcProfit(calcType,symbol,OrderGetDouble(ORDER_VOLUME_CURRENT),OrderGetDouble(ORDER_PRICE_OPEN),sl,loss)) return DBL_MAX;
+      risk+=MathAbs(loss);
+   }
+   return risk;
+}
+
+bool CanAddRisk(string symbol, ENUM_ORDER_TYPE type, double entry, double sl, double volume) {
+   double loss=0;
+   ENUM_ORDER_TYPE calcType=(type==ORDER_TYPE_BUY_LIMIT ? ORDER_TYPE_BUY : ORDER_TYPE_SELL);
+   if(!OrderCalcProfit(calcType,symbol,volume,entry,sl,loss) || loss>=0) return false;
+   double maxRisk=AccountInfoDouble(ACCOUNT_BALANCE)*MaxTotalRiskPercent/100.0;
+   return ExistingRiskMoney()+MathAbs(loss)<=maxRisk;
+}
+
+bool BrokerLevelsAreValid(string symbol, string side, double entry, double sl, double tp) {
+   double point = SymbolInfoDouble(symbol,SYMBOL_POINT);
+   int stops = (int)SymbolInfoInteger(symbol,SYMBOL_TRADE_STOPS_LEVEL);
+   int freeze = (int)SymbolInfoInteger(symbol,SYMBOL_TRADE_FREEZE_LEVEL);
+   double minDistance = MathMax(stops,freeze) * point;
+   MqlTick tick; if(point<=0 || !SymbolInfoTick(symbol,tick)) return false;
+   if(side=="BUY") return entry < tick.ask-minDistance && sl < entry-minDistance && tp > entry+minDistance;
+   if(side=="SELL") return entry > tick.bid+minDistance && sl > entry+minDistance && tp < entry-minDistance;
+   return false;
 }
 
 bool TrendlineIsAligned(string symbol, string side) {
@@ -99,18 +175,23 @@ bool TrendlineIsAligned(string symbol, string side) {
    if(maFast == INVALID_HANDLE || maSlow == INVALID_HANDLE) return false;
    double fast[], slow[];
    MqlRates rateData[];
-   if(CopyRates(symbol,PERIOD_CURRENT,0,TrendLookback,rateData) < TrendLookback) return false;
-   if(CopyBuffer(maFast,0,0,TrendLookback,fast) < TrendLookback) return false;
-   if(CopyBuffer(maSlow,0,0,TrendLookback,slow) < TrendLookback) return false;
-   double lastFast = fast[TrendLookback-1];
-   double lastSlow = slow[TrendLookback-1];
-   if(side=="BUY") return lastFast > lastSlow;
-   if(side=="SELL") return lastFast < lastSlow;
-   return false;
+   ArraySetAsSeries(fast,true);
+   ArraySetAsSeries(slow,true);
+   bool ready=(CopyRates(symbol,PERIOD_CURRENT,0,TrendLookback,rateData) >= TrendLookback &&
+               CopyBuffer(maFast,0,0,TrendLookback,fast) >= TrendLookback &&
+               CopyBuffer(maSlow,0,0,TrendLookback,slow) >= TrendLookback);
+   if(!ready) { IndicatorRelease(maFast); IndicatorRelease(maSlow); return false; }
+   double lastFast = fast[0];
+   double lastSlow = slow[0];
+   bool aligned = (side=="BUY" && lastFast > lastSlow) || (side=="SELL" && lastFast < lastSlow);
+   IndicatorRelease(maFast);
+   IndicatorRelease(maSlow);
+   return aligned;
 }
 
 bool RetestIsValid(string symbol, string side, double entry) {
    MqlRates rates[];
+   ArraySetAsSeries(rates,true);
    int total = CopyRates(symbol,PERIOD_CURRENT,0,TrendLookback,rates);
    if(total < TrendLookback) return false;
    double low = 999999.0, high = -999999.0;
@@ -127,6 +208,7 @@ bool RetestIsValid(string symbol, string side, double entry) {
 bool FVGIsValid(string symbol, string side) {
    if(!EnableFVGScan) return true;
    MqlRates rates[];
+   ArraySetAsSeries(rates,true);
    int total = CopyRates(symbol,PERIOD_CURRENT,0,25,rates);
    if(total < 25) return false;
    double a = rates[2].low, b = rates[2].high, c = rates[1].low, d = rates[1].high;
@@ -136,15 +218,15 @@ bool FVGIsValid(string symbol, string side) {
    return false;
 }
 
-bool StrategyAllowed(string strategy, string side) {
+bool StrategyAllowed(string symbol, string strategy, string side, double entry) {
    strategy = NormalizeStrategy(strategy);
-   if(!IsMarketSafe(ActiveSymbol())) return false;
-   if(strategy=="SCALP") return EnableScalp && TrendlineIsAligned(ActiveSymbol(),side);
-   if(strategy=="SWING") return EnableSwing && RetestIsValid(ActiveSymbol(),side,MarketInfo(ActiveSymbol(),MODE_BID));
-   if(strategy=="SNIPER") return EnableSniper && TrendlineIsAligned(ActiveSymbol(),side) && RetestIsValid(ActiveSymbol(),side,MarketInfo(ActiveSymbol(),MODE_BID));
-   if(strategy=="FVG") return EnableFVGScan && FVGIsValid(ActiveSymbol(),side);
-   if(strategy=="MIXED") return TrendlineIsAligned(ActiveSymbol(),side) || FVGIsValid(ActiveSymbol(),side);
-   return EnableTrendlineScan && TrendlineIsAligned(ActiveSymbol(),side);
+   if(!IsMarketSafe(symbol)) return false;
+   if(strategy=="SCALP") return EnableScalp && TrendlineIsAligned(symbol,side);
+   if(strategy=="SWING") return EnableSwing && RetestIsValid(symbol,side,entry);
+   if(strategy=="SNIPER") return EnableSniper && TrendlineIsAligned(symbol,side) && RetestIsValid(symbol,side,entry);
+   if(strategy=="FVG") return EnableFVGScan && FVGIsValid(symbol,side);
+   if(strategy=="MIXED") return TrendlineIsAligned(symbol,side) || FVGIsValid(symbol,side);
+   return EnableTrendlineScan && TrendlineIsAligned(symbol,side);
 }
 
 void DrawStructure() {
@@ -153,6 +235,7 @@ void DrawStructure() {
    string objPrefix = "AZT_" + symbol; 
    ObjectsDeleteAll(0, objPrefix);
    MqlRates rates[];
+   ArraySetAsSeries(rates,true);
    int total = CopyRates(symbol,PERIOD_CURRENT,0,TrendLookback,rates);
    if(total < TrendLookback) return;
    double highest = rates[0].high, lowest = rates[0].low;
@@ -172,20 +255,17 @@ void DrawStructure() {
    ObjectSetDouble(0, topLine, OBJPROP_PRICE, highest);
    ObjectSetDouble(0, botLine, OBJPROP_PRICE, lowest);
    string trend = objPrefix + "_TREND";
-   if(!ObjectCreate(0, trend, OBJ_TRENDBYANGLE, 0, 0, 0)) {
+   datetime t1 = rates[total-1].time;
+   datetime t0 = rates[0].time;
+   double y1 = rates[total-1].close;
+   double y0 = rates[0].close;
+   if(!ObjectCreate(0, trend, OBJ_TREND, 0, t1, y1, t0, y0)) {
       Print("Failed to create trendline object");
       return;
    }
    ObjectSetInteger(0, trend, OBJPROP_COLOR, clrLimeGreen);
    ObjectSetInteger(0, trend, OBJPROP_WIDTH, 2);
-   datetime t1 = rates[total-1].time;
-   datetime t0 = rates[0].time;
-   double y1 = rates[total-1].close;
-   double y0 = rates[0].close;
-   ObjectSetDouble(0, trend, OBJPROP_TIME1, t0);
-   ObjectSetDouble(0, trend, OBJPROP_TIME2, t1);
-   ObjectSetDouble(0, trend, OBJPROP_PRICE1, y0);
-   ObjectSetDouble(0, trend, OBJPROP_PRICE2, y1);
+   ObjectSetInteger(0, trend, OBJPROP_RAY_RIGHT, false);
 }
 
 bool ProcessCommand(string response) {
@@ -201,14 +281,20 @@ bool ProcessCommand(string response) {
    if(!SymbolSelect(symbol,true)) { Print("Symbol unavailable: ",symbol); return false; }
    if(HasSignal(id)) return true;
    if(orderKind!="LIMIT" || (side!="BUY" && side!="SELL")) { Print("Only BUY/SELL LIMIT commands accepted"); return false; }
-   if(!StrategyAllowed(strategy, side)) { Print("Signal blocked by strategy/risk gate: ",strategy); return false; }
    double entry=StringToDouble(fields[5]), sl=StringToDouble(fields[6]);
    double tp1=StringToDouble(fields[7]), tp2=StringToDouble(fields[8]), tp3=StringToDouble(fields[9]), risk=StringToDouble(fields[10]);
+   if(!StrategyAllowed(symbol,strategy,side,entry)) { Print("Signal blocked by strategy/risk gate: ",strategy); return false; }
    MqlTick tick; if(!SymbolInfoTick(symbol,tick)) return false;
    if((side=="BUY" && entry>=tick.ask) || (side=="SELL" && entry<=tick.bid)) { Print("Limit entry is already crossed; rejecting stale signal."); return false; }
+   double stopDistance=MathAbs(entry-sl), reward=MathAbs(tp1-entry);
+   if(stopDistance<=0 || reward/stopDistance<MinRiskReward) { Print("Order rejected: risk/reward below minimum."); return false; }
+   if((side=="BUY" && !(sl<entry && entry<tp1 && tp1<=tp2 && tp2<=tp3)) ||
+      (side=="SELL" && !(sl>entry && entry>tp1 && tp1>=tp2 && tp2>=tp3))) { Print("Order rejected: invalid SL/TP direction."); return false; }
+   if(!BrokerLevelsAreValid(symbol,side,entry,sl,tp3)) { Print("Order rejected: broker stops/freeze level violation."); return false; }
    ENUM_ORDER_TYPE type=(side=="BUY" ? ORDER_TYPE_BUY_LIMIT : ORDER_TYPE_SELL_LIMIT);
    double vol=VolumeForRisk(symbol,type,entry,sl,risk);
    if(vol<=0) { Print("Order rejected: volume below broker minimum or invalid SL."); return false; }
+   if(!CanAddRisk(symbol,type,entry,sl,vol)) { Print("Order rejected: total account risk limit reached."); return false; }
    trade.SetExpertMagicNumber(MagicNumber);
    trade.SetDeviationInPoints(SlippagePoints);
    string comment="AZT-"+id;
@@ -232,6 +318,15 @@ bool RunSelfTest() {
    }
    Print("SELFTEST FAIL: server monitor not responding. HTTP=",code," LastError=",GetLastError());
    return false;
+}
+
+void RunScheduledSelfTest() {
+   if(SelfTestMinutes<=0) return;
+   datetime now=TimeCurrent();
+   if(LastSelfTest==0 || now-LastSelfTest>=SelfTestMinutes*60) {
+      LastSelfTest=now;
+      RunSelfTest();
+   }
 }
 
 void PollServer() {
@@ -277,18 +372,16 @@ int OnInit() {
    trade.SetExpertMagicNumber(MagicNumber);
    EventSetTimer(PollSeconds);
    if(AutoDrawStructure) DrawStructure();
-   RunSelfTest();
+   RunScheduledSelfTest();
    return INIT_SUCCEEDED;
 }
 void OnDeinit(const int reason) { EventKillTimer(); }
 void OnTimer() {
    if(AutoDrawStructure) DrawStructure();
-   RunSelfTest();
+   RunScheduledSelfTest();
    PollServer();
    ManagePartialCloses();
 }
 void OnTick() {
-   if(AutoDrawStructure) DrawStructure();
-   RunSelfTest();
    ManagePartialCloses();
 }

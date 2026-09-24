@@ -14,7 +14,7 @@ Revoke every Telegram/OpenAI key previously pasted into chat. Put newly generate
 
 ## Setup
 
-1. Copy `server/.env.example` to `server/.env`. Add a new Telegram token, `APP_API_KEY`, `TV_WEBHOOK_SECRET`, `OPENAI_API_KEY_1`, and `GEMINI_API_KEY`. Leave `TELEGRAM_CHAT_ID` blank.
+1. Copy `server/.env.example` to `server/.env`. Add a new Telegram token, `APP_API_KEY`, `TV_WEBHOOK_SECRET`, `OPENAI_API_KEY_1`, `GEMINI_API_KEY`, and `ANTHROPIC_API_KEY`. Leave `TELEGRAM_CHAT_ID` blank.
 2. Run `pip install -r server/requirements.txt`, then run `python server.py`. Alternatively use `docker compose up -d --build`.
 3. Publish server port 8080 through a public HTTPS domain, then set `PUBLIC_BASE_URL=https://YOUR_DOMAIN`. Telegram webhook setup is automatic at server startup. TradingView and Telegram webhooks cannot call a private/local address.
 4. Set the TradingView alert webhook URL to `https://YOUR_DOMAIN/tradingview/webhook`.
@@ -24,7 +24,7 @@ Revoke every Telegram/OpenAI key previously pasted into chat. Put newly generate
 
 ## AI rule
 
-With `AI_ENABLED=true`, OpenAI is the technical analyst and Gemini is the risk auditor. Both receive the same EMA, RSI, MACD, ATR, zone, entry, SL, TP and timeframe facts. A Telegram signal is sent only if both approve it and their combined score reaches `AI_MIN_CONFIDENCE`. AI is an additional filter, not a promise of accuracy.
+With `AI_ENABLED=true`, OpenAI is the technical analyst and Gemini is the risk auditor. When `ANTHROPIC_API_KEY` and `CLAUDE_ENABLED=true` are set, Claude is a third independent risk auditor. Every configured reviewer receives the same EMA, RSI, MACD, ATR, zone, entry, SL, TP and timeframe facts and must approve the signal. The endpoint is `https://api.anthropic.com/v1/messages`. AI is an additional filter, not a promise of accuracy.
 
 ## Defaults
 
