@@ -1,387 +1,354 @@
-//+------------------------------------------------------------------+
-//| AI Zone Trader EA: Telegram-confirmed pending orders only.      |
-//| Safer, multi-strategy, always-on market monitor.                |
-//+------------------------------------------------------------------+
+// MT5-only signals. No server, webhook or API key required.
 #property strict
-#property version   "0.2"
+#property version "1.10"
+#property description "Closed-candle EMA/RSI signals. Automatic orders are OFF by default."
 #include <Trade/Trade.mqh>
 
-input string ServerUrl = "https://server-xi-rose-97.vercel.app/";
-input string ApiKey = "mt5_mql5_secret_key";
-input string SymbolOverride = "";              // e.g. XAUUSD.a; blank = current chart
+input ENUM_TIMEFRAMES SignalTimeframe = PERIOD_CURRENT;
+input int FastEMA = 21;
+input int SlowEMA = 55;
+input int RSIPeriod = 14;
+input int ATRPeriod = 14;
+input bool EnableCrossSignals = true;
+input bool EnablePullbackSignals = true;
+input double RSIBuyMin = 50.0;
+input double RSIBuyMax = 70.0;
+input double RSISellMin = 30.0;
+input double RSISellMax = 50.0;
+input int CooldownBars = 3;
+input int SwingLookback = 10;
+input double StopATR = 1.5;
+input double TP1_R = 1.2;
+input double TP2_R = 2.0;
+input double TP3_R = 3.0;
+input int HistoryBars = 200;            // Historical arrows only; no old orders/alerts
+input bool PopupAlerts = true;
+input bool PushNotifications = false; // Configure MT5 Notifications first
+input bool DrawLevels = true;
+input bool DrawTrendlines = true;
+input bool DrawOrderBlocks = true;
+input bool DrawStructureBreaks = true;
+input int StructureLookback = 500;
+input int PivotBars = 3;               // Left AND right confirmation candles
+input int OBSearchBars = 20;
+input double OBImpulseATR = 0.8;       // Breakout candle body / ATR
+input int MaxOrderBlocks = 8;
+input int OBMaxAgeBars = 200;
+input int StructureExtendBars = 20;
+input bool EnableAutoTrading = false;
 input double MaxRiskPercent = 0.50;
-input double MaxTotalRiskPercent = 1.50;
-input double MaxDailyLossPercent = 2.00;
-input int MaxConsecutiveLosses = 3;
-input int PollSeconds = 10;
-input ulong MagicNumber = 260916;
-input int SlippagePoints = 30;
-input double MinRiskReward = 1.20;
-input int SelfTestMinutes = 15;
-input int TrendLookback = 40;
-input int ConfirmationBars = 2;
-input double MaxSpreadPoints = 18.0;
+input double MaxDailyLossPercent = 2.0;
 input double MaxDrawdownPercent = 10.0;
-input int MaxOpenPositions = 1;
-input bool EnableTrendlineScan = true;
-input bool EnableFVGScan = true;
-input bool EnableScalp = true;
-input bool EnableSwing = true;
-input bool EnableSniper = true;
-input bool AutoDrawStructure = true;
+input int MaxConsecutiveLosses = 3;
+input int MaxOpenPositions = 1;        // Account-wide positions + pending orders
+input double MaxSpreadPoints = 18.0;   // AUTO ORDERS ONLY, broker points
+input double MaxEntryDriftATR = 0.5;
+input int SlippagePoints = 30;
+input ulong MagicNumber = 260916;
 
-CTrade trade;
-datetime LastSelfTest = 0;
+CTrade Trade;
+int FastHandle=INVALID_HANDLE, SlowHandle=INVALID_HANDLE;
+int RSIHandle=INVALID_HANDLE, ATRHandle=INVALID_HANDLE;
+ENUM_TIMEFRAMES TF;
+MqlRates Rates[];
+double Fast[], Slow[], RSI[], ATR[];
+datetime LastClosedBar=0, LastSignalBar=0;
+bool Ready=false;
+string Prefix, Status="Starting", LastSignal="none", TradeStatus="";
+int HistoricalSignals=0;
 
-string ActiveSymbol() { return SymbolOverride == "" ? _Symbol : SymbolOverride; }
+#include "AZT_Structure.mqh"
 
-string NormalizeStrategy(string str) {
-   string s = str;
-   StringToUpper(s);
-   if(s=="SCALP" || s=="SCALPING") return "SCALP";
-   if(s=="SWING") return "SWING";
-   if(s=="SNIPER") return "SNIPER";
-   if(s=="FVG") return "FVG";
-   if(s=="TRENDLINE") return "TRENDLINE";
-   if(s=="MIXED") return "MIXED";
-   return "TRENDLINE";
+struct LocalSignal {
+   int side; // 1 = BUY, -1 = SELL
+   datetime time;
+   double entry, sl, tp1, tp2, tp3, atr;
+   string setup;
+};
+
+int RequiredBars() {
+   return MathMax(SlowEMA*3,MathMax(RSIPeriod,ATRPeriod)*3)+SwingLookback+3;
 }
 
-bool HasSignal(const string id) {
-   string needle = "AZT-" + id;
-   for(int i=OrdersTotal()-1; i>=0; i--) {
-      ulong ticket=OrderGetTicket(i);
-      if(ticket>0 && (ulong)OrderGetInteger(ORDER_MAGIC)==MagicNumber && StringFind(OrderGetString(ORDER_COMMENT),needle)>=0) return true;
+double TickPrice(double price, int direction=0) {
+   double step=SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_SIZE);
+   if(step<=0) step=_Point;
+   double units=price/step;
+   double rounded=(direction<0 ? MathFloor(units) : direction>0 ? MathCeil(units) : MathRound(units));
+   return NormalizeDouble(rounded*step,_Digits);
+}
+
+bool LoadData(int count) {
+   // Series arrays: 0 = forming candle, 1 = last CLOSED candle.
+   if(BarsCalculated(FastHandle)<count || BarsCalculated(SlowHandle)<count ||
+      BarsCalculated(RSIHandle)<count || BarsCalculated(ATRHandle)<count) return false;
+   return CopyRates(_Symbol,TF,0,count,Rates)==count &&
+          CopyBuffer(FastHandle,0,0,count,Fast)==count &&
+          CopyBuffer(SlowHandle,0,0,count,Slow)==count &&
+          CopyBuffer(RSIHandle,0,0,count,RSI)==count &&
+          CopyBuffer(ATRHandle,0,0,count,ATR)==count;
+}
+
+bool EvaluateSignal(int shift, LocalSignal &signal, string &reason) {
+   if(shift<1 || shift+SwingLookback>=ArraySize(Rates)) { reason="Waiting for history"; return false; }
+   if(ATR[shift]<=0 || ATR[shift]==EMPTY_VALUE || Fast[shift]==EMPTY_VALUE ||
+      Slow[shift]==EMPTY_VALUE || RSI[shift]==EMPTY_VALUE) { reason="Indicators warming up"; return false; }
+   bool up=Fast[shift]>Slow[shift] && Rates[shift].close>Fast[shift];
+   bool down=Fast[shift]<Slow[shift] && Rates[shift].close<Fast[shift];
+   int side=up ? 1 : down ? -1 : 0;
+   if(side==0) { reason="Waiting: price and EMA trend disagree"; return false; }
+   double momentum=RSI[shift];
+   if((side==1 && !(momentum>RSIBuyMin && momentum<RSIBuyMax)) ||
+      (side==-1 && !(momentum>RSISellMin && momentum<RSISellMax))) {
+      reason="Waiting: RSI filter ("+DoubleToString(momentum,1)+")"; return false;
    }
-   for(int i=PositionsTotal()-1; i>=0; i--) {
-      ulong ticket=PositionGetTicket(i);
-      if(ticket>0 && (ulong)PositionGetInteger(POSITION_MAGIC)==MagicNumber && StringFind(PositionGetString(POSITION_COMMENT),needle)>=0) return true;
+   bool cross=side==1 ? Fast[shift+1]<=Slow[shift+1] : Fast[shift+1]>=Slow[shift+1];
+   bool pullback=side==1 ? (Rates[shift].low<=Fast[shift] && Rates[shift].close>Rates[shift].open)
+                        : (Rates[shift].high>=Fast[shift] && Rates[shift].close<Rates[shift].open);
+   if(!(EnableCrossSignals && cross) && !(EnablePullbackSignals && pullback)) {
+      reason="Waiting: EMA crossover or pullback"; return false;
    }
-   return false;
-}
-
-double VolumeForRisk(string symbol, ENUM_ORDER_TYPE type, double entry, double sl, double riskPct) {
-   double maxLoss=AccountInfoDouble(ACCOUNT_BALANCE)*MathMin(riskPct,MaxRiskPercent)/100.0;
-   double profit=0;
-   ENUM_ORDER_TYPE calcType=(type==ORDER_TYPE_BUY_LIMIT ? ORDER_TYPE_BUY : ORDER_TYPE_SELL);
-   if(!OrderCalcProfit(calcType,symbol,1.0,entry,sl,profit) || profit>=0) return 0;
-   double lots=maxLoss/MathAbs(profit);
-   double step=SymbolInfoDouble(symbol,SYMBOL_VOLUME_STEP);
-   double minLot=SymbolInfoDouble(symbol,SYMBOL_VOLUME_MIN);
-   double maxLot=SymbolInfoDouble(symbol,SYMBOL_VOLUME_MAX);
-   lots=MathFloor(lots/step)*step;
-   lots=MathMin(lots,maxLot);
-   if(lots<minLot) return 0;
-   return NormalizeDouble(lots,2);
-}
-
-void QueuePartialState(string id, double tp1, double tp2) {
-   GlobalVariableSet("AZT_TP1_"+id,tp1);
-   GlobalVariableSet("AZT_TP2_"+id,tp2);
-}
-
-void Acknowledge(string id) {
-   char data[], result[]; string responseHeaders;
-   string headers="X-Api-Key: "+ApiKey+"\r\n";
-   WebRequest("POST",ServerUrl+"/mt5/ack/"+id,headers,5000,data,result,responseHeaders);
-}
-
-bool IsMarketSafe(string symbol) {
-   MqlTick tick;
-   if(!SymbolInfoTick(symbol,tick)) return false;
-   double point=SymbolInfoDouble(symbol,SYMBOL_POINT);
-   if(point<=0) return false;
-   double spread = (tick.ask - tick.bid) / point;
-   if(spread > MaxSpreadPoints) return false;
-   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
-   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
-   if(balance <= 0.0) return false;
-   double drawdown = ((balance - equity) / balance) * 100.0;
-   if(drawdown > MaxDrawdownPercent) return false;
-   if(!DailyRiskIsSafe()) return false;
-   if(PositionsTotal() >= MaxOpenPositions) return false;
+   signal.side=side; signal.time=Rates[shift].time; signal.atr=ATR[shift];
+   signal.setup=(EnableCrossSignals && cross) ? "EMA cross" : "EMA pullback";
+   signal.entry=TickPrice(Rates[shift].close);
+   double extreme=(side==1 ? Rates[shift].low : Rates[shift].high);
+   for(int i=shift+1;i<shift+SwingLookback;i++)
+      extreme=side==1 ? MathMin(extreme,Rates[i].low) : MathMax(extreme,Rates[i].high);
+   double distance=MathMax(StopATR*signal.atr,MathAbs(signal.entry-extreme)+0.2*signal.atr);
+   signal.sl=TickPrice(signal.entry-side*distance,-side);
+   distance=MathAbs(signal.entry-signal.sl);
+   signal.tp1=TickPrice(signal.entry+side*distance*TP1_R,side);
+   signal.tp2=TickPrice(signal.entry+side*distance*TP2_R,side);
+   signal.tp3=TickPrice(signal.entry+side*distance*TP3_R,side);
+   if(signal.sl<=0 || signal.tp3<=0 || distance<=0) { reason="Invalid price levels"; return false; }
+   reason=signal.setup;
    return true;
 }
 
-bool DailyRiskIsSafe() {
-   datetime dayStart=StringToTime(TimeToString(TimeCurrent(),TIME_DATE));
-   if(!HistorySelect(dayStart,TimeCurrent())) return false;
-   double dailyLoss=0;
-   int consecutiveLosses=0;
+bool CoolingDown(int shift) {
+   if(LastSignalBar==0 || CooldownBars==0) return false;
+   int previous=iBarShift(_Symbol,TF,LastSignalBar,true);
+   return previous>=shift && previous-shift<CooldownBars;
+}
+
+string Price(double value) { return DoubleToString(value,_Digits); }
+
+void Level(string suffix, double price, color colour) {
+   string name=Prefix+suffix;
+   if(ObjectFind(0,name)<0) ObjectCreate(0,name,OBJ_HLINE,0,0,price);
+   ObjectSetDouble(0,name,OBJPROP_PRICE,price);
+   ObjectSetInteger(0,name,OBJPROP_COLOR,colour);
+   ObjectSetInteger(0,name,OBJPROP_STYLE,STYLE_DOT);
+   ObjectSetString(0,name,OBJPROP_TEXT,suffix);
+}
+
+void DrawSignal(const LocalSignal &signal, bool historical) {
+   string side=signal.side==1 ? "BUY" : "SELL";
+   string name=Prefix+"S_"+(string)(long)signal.time;
+   double at=signal.entry-signal.side*0.3*signal.atr;
+   if(ObjectFind(0,name)<0) ObjectCreate(0,name,signal.side==1 ? OBJ_ARROW_BUY : OBJ_ARROW_SELL,0,signal.time,at);
+   ObjectSetString(0,name,OBJPROP_TOOLTIP,(historical ? "HISTORICAL " : "LIVE ")+side+" "+
+      TimeToString(signal.time)+" | "+signal.setup+" | Entry "+Price(signal.entry)+" | SL "+Price(signal.sl));
+   if(DrawLevels) {
+      Level("Entry",signal.entry,clrGold); Level("SL",signal.sl,clrTomato);
+      Level("TP1",signal.tp1,clrLimeGreen); Level("TP2",signal.tp2,clrLimeGreen); Level("TP3",signal.tp3,clrLimeGreen);
+   }
+   LastSignal=(historical ? "History: " : "Live: ")+side+" "+TimeToString(signal.time)+
+              " | Entry "+Price(signal.entry)+" SL "+Price(signal.sl)+
+              "\nTP1 "+Price(signal.tp1)+" TP2 "+Price(signal.tp2)+" TP3 "+Price(signal.tp3);
+}
+
+void Panel() {
+   MqlTick tick;
+   string spread="waiting";
+   if(SymbolInfoTick(_Symbol,tick) && tick.ask>0 && tick.bid>0)
+      spread=DoubleToString((tick.ask-tick.bid)/_Point,1)+" points";
+   string connection=TerminalInfoInteger(TERMINAL_CONNECTED) ? "connected" : "DISCONNECTED";
+   if(MQLInfoInteger(MQL_TESTER)) connection="Strategy Tester";
+   Comment("AI Zone Trader | MT5 ONLY | ",_Symbol," ",EnumToString(TF),
+      "\nMode: ",EnableAutoTrading ? "AUTO TRADING" : "SIGNALS ONLY", " | ",connection,
+      "\n",Status,"\nLast closed candle: ",TimeToString(LastClosedBar),
+      "\nSpread: ",spread," | Order limit: ",DoubleToString(MaxSpreadPoints,1),
+      "\nHistorical signals: ",HistoricalSignals,"\nLast signal: ",LastSignal,
+      "\nStructure: ",StructureStatus,
+      "\n",TradeStatus);
+}
+
+bool DailyRiskSafe(string &reason) {
+   datetime start=StringToTime(TimeToString(TimeCurrent(),TIME_DATE));
+   if(!HistorySelect(start,TimeCurrent())) { reason="Cannot read account history"; return false; }
+   double net=0;
+   int streak=0;
+   bool latestStreak=true;
    for(int i=HistoryDealsTotal()-1;i>=0;i--) {
       ulong ticket=HistoryDealGetTicket(i);
-      if(ticket==0 || (ulong)HistoryDealGetInteger(ticket,DEAL_MAGIC)!=MagicNumber) continue;
+      // Account-wide P/L includes entry commissions and fees.
+      long type=HistoryDealGetInteger(ticket,DEAL_TYPE);
+      if(type!=DEAL_TYPE_BUY && type!=DEAL_TYPE_SELL) continue;
+      double pnl=HistoryDealGetDouble(ticket,DEAL_PROFIT)+HistoryDealGetDouble(ticket,DEAL_SWAP)+
+                 HistoryDealGetDouble(ticket,DEAL_COMMISSION)+HistoryDealGetDouble(ticket,DEAL_FEE);
+      net+=pnl;
       long entry=HistoryDealGetInteger(ticket,DEAL_ENTRY);
-      if(entry!=DEAL_ENTRY_OUT && entry!=DEAL_ENTRY_OUT_BY) continue;
-      double pnl=HistoryDealGetDouble(ticket,DEAL_PROFIT)+HistoryDealGetDouble(ticket,DEAL_SWAP)+HistoryDealGetDouble(ticket,DEAL_COMMISSION);
-      if(pnl<0) {
-         dailyLoss-=pnl;
-         consecutiveLosses++;
-         if(consecutiveLosses>=MaxConsecutiveLosses) { Print("Consecutive loss limit reached."); return false; }
+      if(latestStreak && (entry==DEAL_ENTRY_OUT || entry==DEAL_ENTRY_OUT_BY || entry==DEAL_ENTRY_INOUT)) {
+         if(pnl<0) streak++;
+         else if(pnl>0) latestStreak=false;
       }
-      else if(pnl>0) consecutiveLosses=0;
    }
    double balance=AccountInfoDouble(ACCOUNT_BALANCE);
-   if(balance<=0) return false;
-   if(dailyLoss/balance*100.0>=MaxDailyLossPercent) { Print("Daily loss limit reached."); return false; }
+   if(balance<=0) { reason="Account balance is zero"; return false; }
+   if(-net>=balance*MaxDailyLossPercent/100.0) { reason="Daily loss limit"; return false; }
+   if(streak>=MaxConsecutiveLosses) { reason="Consecutive loss limit"; return false; }
    return true;
 }
 
-double ExistingRiskMoney() {
-   double risk=0;
-   for(int i=PositionsTotal()-1;i>=0;i--) {
-      ulong ticket=PositionGetTicket(i); if(ticket==0 || (ulong)PositionGetInteger(POSITION_MAGIC)!=MagicNumber) continue;
-      double sl=PositionGetDouble(POSITION_SL); if(sl<=0) return DBL_MAX;
-      double loss=0; string symbol=PositionGetString(POSITION_SYMBOL);
-      ENUM_ORDER_TYPE type=(PositionGetInteger(POSITION_TYPE)==POSITION_TYPE_BUY ? ORDER_TYPE_BUY : ORDER_TYPE_SELL);
-      if(!OrderCalcProfit(type,symbol,PositionGetDouble(POSITION_VOLUME),PositionGetDouble(POSITION_PRICE_OPEN),sl,loss)) return DBL_MAX;
-      risk+=MathAbs(loss);
+bool AutoOrder(const LocalSignal &signal, string &reason) {
+   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) || !MQLInfoInteger(MQL_TRADE_ALLOWED) ||
+      !AccountInfoInteger(ACCOUNT_TRADE_ALLOWED) || !AccountInfoInteger(ACCOUNT_TRADE_EXPERT)) {
+      reason="Algo Trading or account trading permission is OFF"; return false;
    }
-   for(int i=OrdersTotal()-1;i>=0;i--) {
-      ulong ticket=OrderGetTicket(i); if(ticket==0 || (ulong)OrderGetInteger(ORDER_MAGIC)!=MagicNumber) continue;
-      ENUM_ORDER_TYPE type=(ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
-      if(type!=ORDER_TYPE_BUY_LIMIT && type!=ORDER_TYPE_SELL_LIMIT) continue;
-      double sl=OrderGetDouble(ORDER_SL); if(sl<=0) return DBL_MAX;
-      double loss=0; string symbol=OrderGetString(ORDER_SYMBOL);
-      ENUM_ORDER_TYPE calcType=(type==ORDER_TYPE_BUY_LIMIT ? ORDER_TYPE_BUY : ORDER_TYPE_SELL);
-      if(!OrderCalcProfit(calcType,symbol,OrderGetDouble(ORDER_VOLUME_CURRENT),OrderGetDouble(ORDER_PRICE_OPEN),sl,loss)) return DBL_MAX;
-      risk+=MathAbs(loss);
+   if(PositionSelect(_Symbol) || PositionsTotal()+OrdersTotal()>=MaxOpenPositions) {
+      reason="Open position/pending order limit"; return false;
    }
-   return risk;
-}
-
-bool CanAddRisk(string symbol, ENUM_ORDER_TYPE type, double entry, double sl, double volume) {
+   MqlTick tick;
+   if(!SymbolInfoTick(_Symbol,tick) || tick.ask<=0 || tick.bid<=0) { reason="No quote"; return false; }
+   if((tick.ask-tick.bid)/_Point>MaxSpreadPoints) { reason="Spread exceeds MaxSpreadPoints"; return false; }
+   double balance=AccountInfoDouble(ACCOUNT_BALANCE), equity=AccountInfoDouble(ACCOUNT_EQUITY);
+   if(balance<=0 || equity<=0) { reason="No account funds"; return false; }
+   if((balance-equity)/balance*100.0>=MaxDrawdownPercent) { reason="Drawdown limit"; return false; }
+   if(!DailyRiskSafe(reason)) return false;
+   double entry=signal.side==1 ? tick.ask : tick.bid;
+   if(MathAbs(entry-signal.entry)>signal.atr*MaxEntryDriftATR) { reason="Price moved too far from signal"; return false; }
+   double distance=signal.side*(entry-signal.sl);
+   double minStop=SymbolInfoInteger(_Symbol,SYMBOL_TRADE_STOPS_LEVEL)*_Point;
+   double marketClose=signal.side==1 ? tick.bid : tick.ask;
+   if(distance<=0 || signal.side*(marketClose-signal.sl)<=minStop) { reason="SL violates broker stop distance"; return false; }
+   // One broker TP at TP3; TP1 and TP2 are reference levels, not partial closes.
+   double tp=TickPrice(entry+signal.side*distance*TP3_R,signal.side);
+   if(tp<=0 || signal.side*(tp-marketClose)<=minStop) { reason="TP violates broker stop distance"; return false; }
+   ENUM_ORDER_TYPE type=signal.side==1 ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
    double loss=0;
-   ENUM_ORDER_TYPE calcType=(type==ORDER_TYPE_BUY_LIMIT ? ORDER_TYPE_BUY : ORDER_TYPE_SELL);
-   if(!OrderCalcProfit(calcType,symbol,volume,entry,sl,loss) || loss>=0) return false;
-   double maxRisk=AccountInfoDouble(ACCOUNT_BALANCE)*MaxTotalRiskPercent/100.0;
-   return ExistingRiskMoney()+MathAbs(loss)<=maxRisk;
-}
-
-bool BrokerLevelsAreValid(string symbol, string side, double entry, double sl, double tp) {
-   double point = SymbolInfoDouble(symbol,SYMBOL_POINT);
-   int stops = (int)SymbolInfoInteger(symbol,SYMBOL_TRADE_STOPS_LEVEL);
-   int freeze = (int)SymbolInfoInteger(symbol,SYMBOL_TRADE_FREEZE_LEVEL);
-   double minDistance = MathMax(stops,freeze) * point;
-   MqlTick tick; if(point<=0 || !SymbolInfoTick(symbol,tick)) return false;
-   if(side=="BUY") return entry < tick.ask-minDistance && sl < entry-minDistance && tp > entry+minDistance;
-   if(side=="SELL") return entry > tick.bid+minDistance && sl > entry+minDistance && tp < entry-minDistance;
-   return false;
-}
-
-bool TrendlineIsAligned(string symbol, string side) {
-   int maFast = iMA(symbol,PERIOD_CURRENT,9,0,MODE_EMA,PRICE_CLOSE);
-   int maSlow = iMA(symbol,PERIOD_CURRENT,21,0,MODE_EMA,PRICE_CLOSE);
-   if(maFast == INVALID_HANDLE || maSlow == INVALID_HANDLE) return false;
-   double fast[], slow[];
-   MqlRates rateData[];
-   ArraySetAsSeries(fast,true);
-   ArraySetAsSeries(slow,true);
-   bool ready=(CopyRates(symbol,PERIOD_CURRENT,0,TrendLookback,rateData) >= TrendLookback &&
-               CopyBuffer(maFast,0,0,TrendLookback,fast) >= TrendLookback &&
-               CopyBuffer(maSlow,0,0,TrendLookback,slow) >= TrendLookback);
-   if(!ready) { IndicatorRelease(maFast); IndicatorRelease(maSlow); return false; }
-   double lastFast = fast[0];
-   double lastSlow = slow[0];
-   bool aligned = (side=="BUY" && lastFast > lastSlow) || (side=="SELL" && lastFast < lastSlow);
-   IndicatorRelease(maFast);
-   IndicatorRelease(maSlow);
-   return aligned;
-}
-
-bool RetestIsValid(string symbol, string side, double entry) {
-   MqlRates rates[];
-   ArraySetAsSeries(rates,true);
-   int total = CopyRates(symbol,PERIOD_CURRENT,0,TrendLookback,rates);
-   if(total < TrendLookback) return false;
-   double low = 999999.0, high = -999999.0;
-   for(int i=0; i<total; i++) {
-      if(rates[i].low < low) low = rates[i].low;
-      if(rates[i].high > high) high = rates[i].high;
+   if(!OrderCalcProfit(type,_Symbol,1.0,entry,signal.sl,loss) || loss>=0) { reason="Cannot calculate SL risk"; return false; }
+   double step=SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_STEP), minLot=SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN);
+   double maxLot=SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MAX);
+   if(step<=0 || minLot<=0 || maxLot<minLot) { reason="Invalid broker volume limits"; return false; }
+   double budget=MathMin(balance,equity)*MaxRiskPercent/100.0;
+   double volume=NormalizeDouble(MathFloor(MathMin(budget/MathAbs(loss),maxLot)/step)*step,8);
+   if(volume<minLot) { reason="Risk budget below minimum lot; order skipped"; return false; }
+   double margin=0;
+   if(!OrderCalcMargin(type,_Symbol,volume,entry,margin) || margin>AccountInfoDouble(ACCOUNT_MARGIN_FREE)) {
+      reason="Insufficient free margin"; return false;
    }
-   double tolerance = (high - low) * 0.08;
-   if(side=="BUY") return entry >= low && entry <= high && entry <= rates[0].close + tolerance;
-   if(side=="SELL") return entry >= low && entry <= high && entry >= rates[0].close - tolerance;
-   return false;
-}
-
-bool FVGIsValid(string symbol, string side) {
-   if(!EnableFVGScan) return true;
-   MqlRates rates[];
-   ArraySetAsSeries(rates,true);
-   int total = CopyRates(symbol,PERIOD_CURRENT,0,25,rates);
-   if(total < 25) return false;
-   double a = rates[2].low, b = rates[2].high, c = rates[1].low, d = rates[1].high;
-   double gap = MathAbs((rates[0].close - rates[0].open));
-   if(side=="BUY") return (rates[0].close > rates[1].close && d > a && gap > 0) || (rates[0].close > rates[0].open && rates[1].high > rates[2].high);
-   if(side=="SELL") return (rates[0].close < rates[1].close && c < b && gap > 0) || (rates[0].close < rates[0].open && rates[1].low < rates[2].low);
-   return false;
-}
-
-bool StrategyAllowed(string symbol, string strategy, string side, double entry) {
-   strategy = NormalizeStrategy(strategy);
-   if(!IsMarketSafe(symbol)) return false;
-   if(strategy=="SCALP") return EnableScalp && TrendlineIsAligned(symbol,side);
-   if(strategy=="SWING") return EnableSwing && RetestIsValid(symbol,side,entry);
-   if(strategy=="SNIPER") return EnableSniper && TrendlineIsAligned(symbol,side) && RetestIsValid(symbol,side,entry);
-   if(strategy=="FVG") return EnableFVGScan && FVGIsValid(symbol,side);
-   if(strategy=="MIXED") return TrendlineIsAligned(symbol,side) || FVGIsValid(symbol,side);
-   return EnableTrendlineScan && TrendlineIsAligned(symbol,side);
-}
-
-void DrawStructure() {
-   if(!AutoDrawStructure) return;
-   string symbol = ActiveSymbol();
-   string objPrefix = "AZT_" + symbol; 
-   ObjectsDeleteAll(0, objPrefix);
-   MqlRates rates[];
-   ArraySetAsSeries(rates,true);
-   int total = CopyRates(symbol,PERIOD_CURRENT,0,TrendLookback,rates);
-   if(total < TrendLookback) return;
-   double highest = rates[0].high, lowest = rates[0].low;
-   int highIdx = 0, lowIdx = 0;
-   for(int i=1; i<total; i++) {
-      if(rates[i].high > highest) { highest = rates[i].high; highIdx = i; }
-      if(rates[i].low < lowest) { lowest = rates[i].low; lowIdx = i; }
+   Trade.SetTypeFillingBySymbol(_Symbol);
+   string comment="AZT-L-"+(string)(long)signal.time;
+   bool sent=signal.side==1 ? Trade.Buy(volume,_Symbol,entry,signal.sl,tp,comment)
+                           : Trade.Sell(volume,_Symbol,entry,signal.sl,tp,comment);
+   uint code=Trade.ResultRetcode();
+   if(!sent || (code!=TRADE_RETCODE_DONE && code!=TRADE_RETCODE_DONE_PARTIAL && code!=TRADE_RETCODE_PLACED)) {
+      reason="Broker: "+(string)code+" "+Trade.ResultRetcodeDescription(); return false;
    }
-   string topLine = objPrefix + "_TOP";
-   string botLine = objPrefix + "_BOT";
-   if(!ObjectCreate(0, topLine, OBJ_HLINE, 0, 0, highest)) { Print("Failed to create top line for ", symbol); }
-   if(!ObjectCreate(0, botLine, OBJ_HLINE, 0, 0, lowest)) { Print("Failed to create bottom line for ", symbol); }
-   ObjectSetInteger(0, topLine, OBJPROP_COLOR, clrDodgerBlue);
-   ObjectSetInteger(0, botLine, OBJPROP_COLOR, clrTomato);
-   ObjectSetInteger(0, topLine, OBJPROP_STYLE, STYLE_DOT);
-   ObjectSetInteger(0, botLine, OBJPROP_STYLE, STYLE_DOT);
-   ObjectSetDouble(0, topLine, OBJPROP_PRICE, highest);
-   ObjectSetDouble(0, botLine, OBJPROP_PRICE, lowest);
-   string trend = objPrefix + "_TREND";
-   datetime t1 = rates[total-1].time;
-   datetime t0 = rates[0].time;
-   double y1 = rates[total-1].close;
-   double y0 = rates[0].close;
-   if(!ObjectCreate(0, trend, OBJ_TREND, 0, t1, y1, t0, y0)) {
-      Print("Failed to create trendline object");
-      return;
-   }
-   ObjectSetInteger(0, trend, OBJPROP_COLOR, clrLimeGreen);
-   ObjectSetInteger(0, trend, OBJPROP_WIDTH, 2);
-   ObjectSetInteger(0, trend, OBJPROP_RAY_RIGHT, false);
-}
-
-bool ProcessCommand(string response) {
-   string fields[];
-   int n=StringSplit(response,'|',fields);
-   if(n<11 || fields[0]!="OPEN") { Print("Bad server command: ",response); return false; }
-   string id = fields[1];
-   string symbol = fields[2];
-   string side = fields[3];
-   string orderKind = fields[4];
-   string strategy = (n>=12) ? NormalizeStrategy(fields[11]) : "TRENDLINE";
-   if(SymbolOverride!="") symbol=SymbolOverride;
-   if(!SymbolSelect(symbol,true)) { Print("Symbol unavailable: ",symbol); return false; }
-   if(HasSignal(id)) return true;
-   if(orderKind!="LIMIT" || (side!="BUY" && side!="SELL")) { Print("Only BUY/SELL LIMIT commands accepted"); return false; }
-   double entry=StringToDouble(fields[5]), sl=StringToDouble(fields[6]);
-   double tp1=StringToDouble(fields[7]), tp2=StringToDouble(fields[8]), tp3=StringToDouble(fields[9]), risk=StringToDouble(fields[10]);
-   if(!StrategyAllowed(symbol,strategy,side,entry)) { Print("Signal blocked by strategy/risk gate: ",strategy); return false; }
-   MqlTick tick; if(!SymbolInfoTick(symbol,tick)) return false;
-   if((side=="BUY" && entry>=tick.ask) || (side=="SELL" && entry<=tick.bid)) { Print("Limit entry is already crossed; rejecting stale signal."); return false; }
-   double stopDistance=MathAbs(entry-sl), reward=MathAbs(tp1-entry);
-   if(stopDistance<=0 || reward/stopDistance<MinRiskReward) { Print("Order rejected: risk/reward below minimum."); return false; }
-   if((side=="BUY" && !(sl<entry && entry<tp1 && tp1<=tp2 && tp2<=tp3)) ||
-      (side=="SELL" && !(sl>entry && entry>tp1 && tp1>=tp2 && tp2>=tp3))) { Print("Order rejected: invalid SL/TP direction."); return false; }
-   if(!BrokerLevelsAreValid(symbol,side,entry,sl,tp3)) { Print("Order rejected: broker stops/freeze level violation."); return false; }
-   ENUM_ORDER_TYPE type=(side=="BUY" ? ORDER_TYPE_BUY_LIMIT : ORDER_TYPE_SELL_LIMIT);
-   double vol=VolumeForRisk(symbol,type,entry,sl,risk);
-   if(vol<=0) { Print("Order rejected: volume below broker minimum or invalid SL."); return false; }
-   if(!CanAddRisk(symbol,type,entry,sl,vol)) { Print("Order rejected: total account risk limit reached."); return false; }
-   trade.SetExpertMagicNumber(MagicNumber);
-   trade.SetDeviationInPoints(SlippagePoints);
-   string comment="AZT-"+id;
-   bool ok=(side=="BUY") ? trade.BuyLimit(vol,entry,symbol,sl,tp3,ORDER_TIME_GTC,0,comment)
-                            : trade.SellLimit(vol,entry,symbol,sl,tp3,ORDER_TIME_GTC,0,comment);
-   if(!ok) { Print("Order failed: ",trade.ResultRetcode()," ",trade.ResultRetcodeDescription()); return false; }
-   QueuePartialState(id,tp1,tp2);
-   Acknowledge(id);
-   Print("Approved signal placed: ",comment," strategy=",strategy," volume=",vol," TP1=",tp1," TP2=",tp2," TP3=",tp3);
+   reason="Order accepted | lots "+DoubleToString(volume,8)+" | SL "+Price(signal.sl)+" | TP "+Price(tp);
    return true;
 }
 
-bool RunSelfTest() {
-   char data[], result[]; string responseHeaders;
-   string headers="X-Api-Key: "+ApiKey+"\r\n";
-   int code=WebRequest("GET",ServerUrl+"/mt5/test",headers,5000,data,result,responseHeaders);
-   if(code!=-1 && code==200) {
-      string response=CharArrayToString(result);
-      Print("SELFTEST OK: ",response);
-      return true;
-   }
-   Print("SELFTEST FAIL: server monitor not responding. HTTP=",code," LastError=",GetLastError());
-   return false;
-}
-
-void RunScheduledSelfTest() {
-   if(SelfTestMinutes<=0) return;
-   datetime now=TimeCurrent();
-   if(LastSelfTest==0 || now-LastSelfTest>=SelfTestMinutes*60) {
-      LastSelfTest=now;
-      RunSelfTest();
-   }
-}
-
-void PollServer() {
-   char data[], result[]; string responseHeaders;
-   string headers="X-Api-Key: "+ApiKey+"\r\n";
-   ResetLastError();
-   int code=WebRequest("GET",ServerUrl+"/mt5/next",headers,5000,data,result,responseHeaders);
-   if(code==-1) { Print("WebRequest error ",GetLastError(),". Add ServerUrl in MT5 Options > Expert Advisors."); return; }
-   if(code!=200) { Print("Server response HTTP ",code); return; }
-   string response=CharArrayToString(result);
-   StringTrimLeft(response); StringTrimRight(response);
-   if(response!="" && response!="NONE") ProcessCommand(response);
-}
-
-void ManagePartialCloses() {
-   for(int i=PositionsTotal()-1;i>=0;i--) {
-      ulong ticket=PositionGetTicket(i); if(ticket==0) continue;
-      if((ulong)PositionGetInteger(POSITION_MAGIC)!=MagicNumber) continue;
-      string symbol=PositionGetString(POSITION_SYMBOL);
-      double volume=PositionGetDouble(POSITION_VOLUME);
-      string comment=PositionGetString(POSITION_COMMENT);
-      int marker=StringFind(comment,"AZT-");
-      if(marker<0) continue;
-      string id=StringSubstr(comment,marker+4);
-      string key1="AZT_TP1_"+id, key2="AZT_TP2_"+id;
-      if(!GlobalVariableCheck(key1) || !GlobalVariableCheck(key2)) continue;
-      double tp1=GlobalVariableGet(key1), tp2=GlobalVariableGet(key2);
-      MqlTick tick; if(!SymbolInfoTick(symbol,tick)) continue;
-      bool buy=PositionGetInteger(POSITION_TYPE)==POSITION_TYPE_BUY;
-      double price=buy?tick.bid:tick.ask;
-      if(GlobalVariableGet("AZT_STAGE_"+(string)ticket)<1 && ((buy && price>=tp1)||(!buy && price<=tp1))) {
-         double closeVol=NormalizeDouble(volume*0.50,2);
-         if(closeVol>=SymbolInfoDouble(symbol,SYMBOL_VOLUME_MIN) && trade.PositionClosePartial(ticket,closeVol)) GlobalVariableSet("AZT_STAGE_"+(string)ticket,1);
-      } else if(GlobalVariableGet("AZT_STAGE_"+(string)ticket)<2 && ((buy && price>=tp2)||(!buy && price<=tp2))) {
-         double closeVol=NormalizeDouble(volume*0.60,2);
-         if(closeVol>=SymbolInfoDouble(symbol,SYMBOL_VOLUME_MIN) && trade.PositionClosePartial(ticket,closeVol)) GlobalVariableSet("AZT_STAGE_"+(string)ticket,2);
+void Scan() {
+   if(!Ready) {
+      int count=RequiredBars()+MathMax(HistoryBars,StructureLookback);
+      int available=Bars(_Symbol,TF);
+      if(available<RequiredBars()) {
+         CopyRates(_Symbol,TF,0,RequiredBars(),Rates);
+         Status="Waiting for price history"; Panel(); return;
       }
+      count=MathMin(count,available);
+      if(!LoadData(count)) { Status="Waiting for indicator data"; Panel(); return; }
+      RebuildStructure();
+      int oldest=MathMin(HistoryBars,count-RequiredBars());
+      for(int i=oldest;i>=1;i--) {
+         LocalSignal signal; string reason;
+         if(EvaluateSignal(i,signal,reason) && !CoolingDown(i)) {
+            DrawSignal(signal,true); LastSignalBar=signal.time; HistoricalSignals++;
+         }
+      }
+      LastClosedBar=Rates[1].time;
+      Ready=true;
+      Status="Ready: waiting for the next candle close";
+      Print("AZT MT5-only ready: ",_Symbol," ",EnumToString(TF),"; historical signals=",HistoricalSignals,
+            "; auto trading=",EnableAutoTrading,". Historical signals never trigger orders/alerts.");
+      Panel(); return;
    }
+   datetime closed=iTime(_Symbol,TF,1);
+   if(closed<=0 || closed==LastClosedBar) { Panel(); return; }
+   int count=MathMin(Bars(_Symbol,TF),RequiredBars()+StructureLookback);
+   if(count<RequiredBars() || !LoadData(count)) { Status="Waiting for indicator data; will retry"; Panel(); return; }
+   RebuildStructure();
+   // Only mark processed after all data is ready; shared OnTick/OnTimer guard.
+   LastClosedBar=Rates[1].time;
+   LocalSignal signal; string reason;
+   if(!EvaluateSignal(1,signal,reason)) { Status=reason; Print("AZT: ",Status); Panel(); return; }
+   if(CoolingDown(1)) { Status="Waiting: signal cooldown"; Panel(); return; }
+   LastSignalBar=signal.time;
+   DrawSignal(signal,false);
+   Status=(signal.side==1 ? "BUY" : "SELL")+string(" signal: ")+signal.setup;
+   string message="AZT "+_Symbol+" "+EnumToString(TF)+" "+Status+" | "+TimeToString(signal.time)+
+      " | Entry "+Price(signal.entry)+" SL "+Price(signal.sl)+
+      " TP1 "+Price(signal.tp1)+" TP2 "+Price(signal.tp2)+" TP3 "+Price(signal.tp3);
+   Print(message);
+   if(!MQLInfoInteger(MQL_TESTER)) {
+      if(PopupAlerts) Alert(message);
+      if(PushNotifications && !SendNotification(message)) Print("Push notification failed: ",GetLastError());
+   }
+   TradeStatus="Signals only: automatic orders are OFF";
+   if(EnableAutoTrading) {
+      if(TimeCurrent()-iTime(_Symbol,TF,0)>30) TradeStatus="Order skipped: signal received more than 30 seconds late";
+      else {
+         bool ok=AutoOrder(signal,reason);
+         TradeStatus=(ok ? "" : "Order skipped: ")+reason;
+      }
+      Print("AZT: ",TradeStatus);
+   }
+   Panel(); ChartRedraw();
 }
 
 int OnInit() {
-   if(StringFind(ServerUrl,"YOUR_DOMAIN")>=0 || ApiKey=="CHANGE_ME") { Print("Configure ServerUrl and ApiKey first."); return INIT_PARAMETERS_INCORRECT; }
-   trade.SetExpertMagicNumber(MagicNumber);
-   EventSetTimer(PollSeconds);
-   if(AutoDrawStructure) DrawStructure();
-   RunScheduledSelfTest();
+   if(FastEMA<2 || SlowEMA<=FastEMA || SlowEMA>1000 || RSIPeriod<2 || RSIPeriod>1000 ||
+      ATRPeriod<2 || ATRPeriod>1000 || SwingLookback<1 || SwingLookback>500 ||
+      HistoryBars<0 || HistoryBars>2000 || CooldownBars<0 || StopATR<=0 ||
+      StructureLookback<50 || StructureLookback>2000 || PivotBars<1 || PivotBars>20 ||
+      OBSearchBars<1 || OBSearchBars>100 || OBImpulseATR<=0 || MaxOrderBlocks<1 || MaxOrderBlocks>30 ||
+      OBMaxAgeBars<1 || OBMaxAgeBars>2000 || StructureExtendBars<1 || StructureExtendBars>100 ||
+      TP1_R<=0 || TP2_R<TP1_R || TP3_R<TP2_R ||
+      RSIBuyMin<0 || RSIBuyMax>100 || RSIBuyMin>=RSIBuyMax ||
+      RSISellMin<0 || RSISellMax>100 || RSISellMin>=RSISellMax ||
+      (!EnableCrossSignals && !EnablePullbackSignals) || MaxRiskPercent<=0 || MaxRiskPercent>100 ||
+      MaxDailyLossPercent<=0 || MaxDrawdownPercent<=0 || MaxConsecutiveLosses<1 ||
+      MaxOpenPositions<1 || MaxSpreadPoints<=0 || MaxEntryDriftATR<=0 || SlippagePoints<0) {
+      Print("AZT: Invalid input parameters"); return INIT_PARAMETERS_INCORRECT;
+   }
+   TF=SignalTimeframe==PERIOD_CURRENT ? (ENUM_TIMEFRAMES)_Period : SignalTimeframe;
+   Prefix="AZT_LOCAL_"+(string)MagicNumber+"_";
+   ArraySetAsSeries(Rates,true); ArraySetAsSeries(Fast,true); ArraySetAsSeries(Slow,true);
+   ArraySetAsSeries(RSI,true); ArraySetAsSeries(ATR,true);
+   FastHandle=iMA(_Symbol,TF,FastEMA,0,MODE_EMA,PRICE_CLOSE);
+   SlowHandle=iMA(_Symbol,TF,SlowEMA,0,MODE_EMA,PRICE_CLOSE);
+   RSIHandle=iRSI(_Symbol,TF,RSIPeriod,PRICE_CLOSE); ATRHandle=iATR(_Symbol,TF,ATRPeriod);
+   if(FastHandle==INVALID_HANDLE || SlowHandle==INVALID_HANDLE || RSIHandle==INVALID_HANDLE || ATRHandle==INVALID_HANDLE) {
+      Print("AZT: Cannot create indicators: ",GetLastError()); return INIT_FAILED;
+   }
+   Trade.SetExpertMagicNumber(MagicNumber); Trade.SetDeviationInPoints(SlippagePoints);
+   Trade.SetAsyncMode(false);
+   if(!EventSetTimer(2)) { Print("AZT: Cannot start timer"); return INIT_FAILED; }
+   TradeStatus=EnableAutoTrading ? "Auto orders enabled; risk checks apply" : "Signals only: automatic orders are OFF";
+   Panel();
    return INIT_SUCCEEDED;
 }
-void OnDeinit(const int reason) { EventKillTimer(); }
-void OnTimer() {
-   if(AutoDrawStructure) DrawStructure();
-   RunScheduledSelfTest();
-   PollServer();
-   ManagePartialCloses();
+
+void OnDeinit(const int reason) {
+   EventKillTimer();
+   if(FastHandle!=INVALID_HANDLE) IndicatorRelease(FastHandle);
+   if(SlowHandle!=INVALID_HANDLE) IndicatorRelease(SlowHandle);
+   if(RSIHandle!=INVALID_HANDLE) IndicatorRelease(RSIHandle);
+   if(ATRHandle!=INVALID_HANDLE) IndicatorRelease(ATRHandle);
+   if(Prefix!="") ObjectsDeleteAll(0,Prefix);
+   Comment("");
 }
-void OnTick() {
-   ManagePartialCloses();
-}
+void OnTimer() { Scan(); }
+void OnTick() { Scan(); }

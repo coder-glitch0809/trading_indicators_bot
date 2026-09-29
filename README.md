@@ -1,4 +1,18 @@
-# AI Zone Trader: TradingView + MT5 + Telegram
+# AI Zone Trader: MT5 standalone
+
+The main EA, `mt5/AI_Zone_Trader_EA.mq5`, now generates signals directly in MT5.
+No TradingView, Telegram, server, API key or WebRequest permission is required.
+See [MT5 setup in Uzbek](mt5/README_UZ.md).
+
+Default mode is **signals only**: closed-candle BUY/SELL arrows, entry/SL/TP levels,
+popup alerts, and a chart status panel. `EnableAutoTrading=false` means no orders.
+The optional auto mode uses market orders with SL and one final TP at TP3;
+TP1/TP2 are reference levels, not automatic partial closes in this version.
+
+## Legacy TradingView + Telegram version
+
+The original server-dependent EA is preserved as `mt5/AI_Zone_Trader_Server_EA.mq5`.
+The remaining instructions below apply only to that legacy version.
 
 This is a signal-assistance system, not a profit guarantee. It only sends an MT5 order after the Telegram owner presses Confirm.
 
@@ -6,7 +20,7 @@ This is a signal-assistance system, not a profit guarantee. It only sends an MT5
 
 - `tradingview/AI_Zone_Trader.pine`: EMA, RSI, MACD, ATR and pivot-zone overlay with webhook alerts.
 - `server/server.py`: TradingView receiver, OpenAI + Gemini consensus, Telegram confirmation, and MT5 queue.
-- `mt5/AI_Zone_Trader_EA.mq5`: pending orders, risk-based volume, and partial TP closes.
+- `mt5/AI_Zone_Trader_Server_EA.mq5`: pending orders, risk-based volume, and partial TP closes.
 
 ## Security
 

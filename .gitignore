@@ -220,3 +220,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local MT5 test runtime and compiler output
+.mt5-test/
+*.log
+tests/*.ex5
