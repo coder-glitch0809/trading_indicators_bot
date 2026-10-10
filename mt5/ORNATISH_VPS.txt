@@ -1,0 +1,22 @@
+AI Zone Trader - Windows VPS ga o'rnatish
+==========================================
+
+1. VPS ga MetaTrader 5 o'rnating, broker hisobingizga kiring, MT5 ni bir marta yoping.
+2. Shu papkani (AI_Zone_Trader_MT5) VPS ga ko'chiring, masalan C:\AI_Zone_Trader_MT5
+3. Kompyuteringizdagi AZT_Config.ini faylini SHU papkaga qo'ying (kalitlar ichida).
+   Kompyuterdagi joyi: MT5 > File > Open Data Folder > MQL5 > Files > AZT_Config.ini
+4. Papkada PowerShell oching va bajaring:
+      powershell -ExecutionPolicy Bypass -File .\Install-MT5.ps1
+   Natijada 4 ta kalit "filled" deb chiqishi kerak.
+   Keyin AZT_Config.ini ni shu papkadan o'chiring (u endi MT5 ichida).
+5. MT5 ni oching: Tools > Options > Expert Advisors
+      [x] Allow algorithmic trading
+      [x] Allow WebRequest for listed URL:
+            https://api.telegram.org
+            https://api.anthropic.com
+            https://generativelanguage.googleapis.com
+6. Navigator > Expert Advisors > Refresh > AI_Zone_Trader > AI_Zone_Trader_EA ni
+   chartga torting (masalan EURUSD M15). Inputs: Reset, sinov uchun
+   TradeMode = AZT_CONFIRM_EVERY. Tepadagi "Algo Trading" yashil bo'lsin.
+7. Chartdagi "Telegram TEST (tugmali)" va "AI TEST" tugmalarini bosing.
+8. Kompyuteringizdagi MT5 dan EA ni olib tashlang - faqat bitta joyda ishlasin.

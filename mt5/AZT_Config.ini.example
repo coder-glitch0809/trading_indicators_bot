@@ -1,0 +1,9 @@
+# Sample only. The real file is created by Install-MT5.ps1 at
+# MT5 > File > Open Data Folder > MQL5 > Files > AZT_Config.ini
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
+TELEGRAM_ADMIN_ID=
+CLAUDE_API_KEY=
+GEMINI_API_KEY=
+CLAUDE_MODEL=
+GEMINI_MODEL=

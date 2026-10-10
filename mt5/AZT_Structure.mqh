@@ -1,5 +1,8 @@
-// Deterministic chart structure. Included after EA inputs and Rates/ATR globals.
-// An OB here is a candle-range heuristic, not evidence of institutional orders.
+// Causal structure engine: series index 0 is NEVER used to decide a signal.
+// An OB is an opposite candle before an impulsive confirmed swing break,
+// a price-action heuristic, not proof of institutional orders or machine learning.
+#ifndef AZT_STRUCTURE_MQH
+#define AZT_STRUCTURE_MQH
 struct AZTPivot {
    datetime time;
    double price;
@@ -17,6 +20,32 @@ AZTPivot HighPivot, PreviousHigh, LowPivot, PreviousLow;
 AZTBlock Blocks[];
 int StructureBreakCount=0;
 string StructureStatus="Waiting for confirmed pivots";
+int StructureBias=0;
+
+struct AZTStructureSignal {
+   int side;
+   string setup;
+   double stopAnchor;
+};
+AZTStructureSignal StructureSignals[];
+bool StructureCacheReady=false;
+datetime StructureCacheTime=0;
+int StructureCacheSize=0;
+
+void InvalidateStructureCache() { StructureCacheReady=false; }
+
+bool StructureATRValid(int shift) {
+   return shift>=1 && shift<ArraySize(ATR) && MathIsValidNumber(ATR[shift]) &&
+      ATR[shift]>0 && ATR[shift]!=EMPTY_VALUE;
+}
+
+void ExpireStructurePivots(int shift) {
+   // Bound context to the same horizon during historical and live evaluations.
+   if(HighPivot.time>0 && HighPivot.shift-shift>StructureLookback) ZeroMemory(HighPivot);
+   if(PreviousHigh.time>0 && PreviousHigh.shift-shift>StructureLookback) ZeroMemory(PreviousHigh);
+   if(LowPivot.time>0 && LowPivot.shift-shift>StructureLookback) ZeroMemory(LowPivot);
+   if(PreviousLow.time>0 && PreviousLow.shift-shift>StructureLookback) ZeroMemory(PreviousLow);
+}
 
 bool ConfirmedPivot(int center, int confirmingShift, bool high) {
    if(confirmingShift<1 || center-PivotBars<confirmingShift || center+PivotBars>=ArraySize(Rates)) return false;
@@ -39,13 +68,13 @@ void UpdateBlocks(int shift) {
    for(int i=ArraySize(Blocks)-1;i>=0;i--) {
       if(Blocks[i].bornShift<=shift) continue; // No same-candle mitigation.
       bool broken=(Blocks[i].side==1 ? Rates[shift].close<Blocks[i].bottom : Rates[shift].close>Blocks[i].top);
-      if(broken || Blocks[i].bornShift-shift>OBMaxAgeBars) { RemoveBlock(i); continue; }
+      if(broken || Blocks[i].bornShift-shift>MathMin(OBMaxAgeBars,StructureLookback)) { RemoveBlock(i); continue; }
       if(Rates[shift].low<=Blocks[i].top && Rates[shift].high>=Blocks[i].bottom) Blocks[i].touched=true;
    }
 }
 
 bool AddBlock(int shift, int side, int pivotShift) {
-   if(shift<1 || shift>=ArraySize(ATR) || ATR[shift]<=0 || ATR[shift]==EMPTY_VALUE) return false;
+   if(!StructureATRValid(shift)) return false;
    double body=side*(Rates[shift].close-Rates[shift].open);
    if(body<ATR[shift]*OBImpulseATR) return false;
    int oldest=MathMin(pivotShift,MathMin(shift+OBSearchBars,ArraySize(Rates)-1));
@@ -80,6 +109,7 @@ void StructureText(string name, datetime time, double price, string label, color
 }
 
 void ProcessStructureBar(int shift, bool draw=true) {
+   ExpireStructurePivots(shift);
    UpdateBlocks(shift);
    int center=shift+PivotBars;
    if(ConfirmedPivot(center,shift,true)) {
@@ -93,16 +123,95 @@ void ProcessStructureBar(int shift, bool draw=true) {
       LowPivot.shift=center; LowPivot.broken=false;
    }
    if(HighPivot.time>0 && !HighPivot.broken && Rates[shift].close>HighPivot.price) {
+      bool change=StructureBias<0;
       HighPivot.broken=true; StructureBreakCount++;
+      StructureBias=1;
       AddBlock(shift,1,HighPivot.shift);
       if(draw && DrawStructureBreaks)
-         StructureText(Prefix+"STRUCT_BOS_U_"+(string)(long)Rates[shift].time,Rates[shift].time,HighPivot.price,"BOS UP",clrLimeGreen);
+         StructureText(Prefix+"STRUCT_BOS_U_"+(string)(long)Rates[shift].time,Rates[shift].time,HighPivot.price,change ? "CHOCH UP" : "BOS UP",clrLimeGreen);
    }
    if(LowPivot.time>0 && !LowPivot.broken && Rates[shift].close<LowPivot.price) {
+      bool change=StructureBias>0;
       LowPivot.broken=true; StructureBreakCount++;
+      StructureBias=-1;
       AddBlock(shift,-1,LowPivot.shift);
       if(draw && DrawStructureBreaks)
-         StructureText(Prefix+"STRUCT_BOS_D_"+(string)(long)Rates[shift].time,Rates[shift].time,LowPivot.price,"BOS DOWN",clrTomato);
+         StructureText(Prefix+"STRUCT_BOS_D_"+(string)(long)Rates[shift].time,Rates[shift].time,LowPivot.price,change ? "CHOCH DOWN" : "BOS DOWN",clrTomato);
+   }
+}
+
+double StructureLinePrice(const AZTPivot &older,const AZTPivot &newer,datetime at) {
+   if(older.time<=0 || newer.time<=older.time) return 0;
+   return newer.price+(newer.price-older.price)*
+      (double)(at-newer.time)/(double)(newer.time-older.time);
+}
+
+bool StructureLineValid(const AZTPivot &older,const AZTPivot &newer,int shift,int side) {
+   if(older.time<=0 || newer.time<=older.time || newer.shift-PivotBars<=shift) return false;
+   // A rising support or falling resistance only. Both pivots existed before this candle.
+   if(side*(newer.price-older.price)<=0) return false;
+   for(int i=newer.shift-PivotBars;i>shift;i--) {
+      double line=StructureLinePrice(older,newer,Rates[i].time);
+      if(line<=0 || side*(Rates[i].close-line)<0) return false;
+   }
+   return true;
+}
+
+void FindStructureSetup(int shift,AZTStructureSignal &candidate) {
+   ZeroMemory(candidate);
+   if(!StructureATRValid(shift) || shift+1>=ArraySize(Rates)) return;
+   ExpireStructurePivots(shift);
+   double body=Rates[shift].close-Rates[shift].open;
+   // Examine untouched blocks BEFORE this candle marks them mitigated.
+   if(EnableOrderBlockSignals) {
+      for(int i=ArraySize(Blocks)-1;i>=0;i--) {
+         if(Blocks[i].touched || Blocks[i].bornShift<=shift ||
+            Blocks[i].bornShift-shift>MathMin(OBMaxAgeBars,StructureLookback)) continue;
+         bool touch=Rates[shift].low<=Blocks[i].top && Rates[shift].high>=Blocks[i].bottom;
+         bool rejection=Blocks[i].side==1 ? Rates[shift].close>Blocks[i].top && body>0
+                                         : Rates[shift].close<Blocks[i].bottom && body<0;
+         if(!touch || !rejection) continue;
+         candidate.side=Blocks[i].side;
+         candidate.setup="Fresh order-block rejection";
+         candidate.stopAnchor=candidate.side==1 ? MathMin(Blocks[i].bottom,Rates[shift].low)
+                                                : MathMax(Blocks[i].top,Rates[shift].high);
+         return;
+      }
+   }
+   if(EnableStructureBreakSignals) {
+      if(HighPivot.time>0 && !HighPivot.broken && Rates[shift].close>HighPivot.price &&
+         Rates[shift+1].close<=HighPivot.price && body>=ATR[shift]*OBImpulseATR) {
+         candidate.side=1;
+         candidate.setup=StructureBias<0 ? "Bullish CHOCH impulse" : "Bullish BOS impulse";
+         candidate.stopAnchor=LowPivot.time>0 ? MathMin(LowPivot.price,Rates[shift].low) : Rates[shift].low;
+         return;
+      }
+      if(LowPivot.time>0 && !LowPivot.broken && Rates[shift].close<LowPivot.price &&
+         Rates[shift+1].close>=LowPivot.price && -body>=ATR[shift]*OBImpulseATR) {
+         candidate.side=-1;
+         candidate.setup=StructureBias>0 ? "Bearish CHOCH impulse" : "Bearish BOS impulse";
+         candidate.stopAnchor=HighPivot.time>0 ? MathMax(HighPivot.price,Rates[shift].high) : Rates[shift].high;
+         return;
+      }
+   }
+   if(!EnableTrendlineSignals) return;
+   double tolerance=ATR[shift]*TrendlineToleranceATR;
+   if(body>0 && StructureLineValid(PreviousLow,LowPivot,shift,1)) {
+      double line=StructureLinePrice(PreviousLow,LowPivot,Rates[shift].time);
+      if(line>0 && Rates[shift].low<=line+tolerance && Rates[shift].low>=line-tolerance &&
+         Rates[shift].close>line) {
+         candidate.side=1; candidate.setup="Rising trendline rejection";
+         candidate.stopAnchor=MathMin(Rates[shift].low,LowPivot.price);
+         return;
+      }
+   }
+   if(body<0 && StructureLineValid(PreviousHigh,HighPivot,shift,-1)) {
+      double line=StructureLinePrice(PreviousHigh,HighPivot,Rates[shift].time);
+      if(line>0 && Rates[shift].high>=line-tolerance && Rates[shift].high<=line+tolerance &&
+         Rates[shift].close<line) {
+         candidate.side=-1; candidate.setup="Falling trendline rejection";
+         candidate.stopAnchor=MathMax(Rates[shift].high,HighPivot.price);
+      }
    }
 }
 
@@ -113,21 +222,50 @@ void Trendline(string name, const AZTPivot &older, const AZTPivot &newer, color 
    ObjectSetInteger(0,name,OBJPROP_COLOR,colour);
    ObjectSetInteger(0,name,OBJPROP_WIDTH,2);
    ObjectSetInteger(0,name,OBJPROP_SELECTABLE,false);
-   ObjectSetString(0,name,OBJPROP_TOOLTIP,"Last two confirmed swing pivots; projection is not a trade signal");
+   ObjectSetString(0,name,OBJPROP_TOOLTIP,"Last two confirmed swing pivots; signals require closed-candle rejection and configured filters");
 }
 
 void ResetStructure() {
    ZeroMemory(HighPivot); ZeroMemory(PreviousHigh); ZeroMemory(LowPivot); ZeroMemory(PreviousLow);
-   ArrayResize(Blocks,0); StructureBreakCount=0;
+   ArrayResize(Blocks,0); StructureBreakCount=0; StructureBias=0;
+}
+
+void BuildStructureCache(bool draw=false) {
+   ResetStructure();
+   int count=ArraySize(Rates);
+   ArrayResize(StructureSignals,count);
+   for(int i=0;i<count;i++) ZeroMemory(StructureSignals[i]);
+   // One linear chronological replay caches every setup. Evaluating historical
+   // shift N never reads OHLC/ATR at N-1, N-2 or the forming bar at index 0.
+   int oldest=count-2*PivotBars-1;
+   for(int shift=oldest;shift>=1;shift--) {
+      if(shift==StructureLookback) StructureBreakCount=0;
+      FindStructureSetup(shift,StructureSignals[shift]);
+      ProcessStructureBar(shift,draw && shift<=StructureLookback);
+   }
+   StructureCacheSize=count;
+   StructureCacheTime=count>1 ? Rates[1].time : 0;
+   StructureCacheReady=true;
+}
+
+bool EvaluateStructureSignal(int shift,int &side,string &setup,double &stopAnchor,string &reason) {
+   side=0; setup=""; stopAnchor=0;
+   if(shift<1 || shift+2*PivotBars+1>=ArraySize(Rates)) {
+      reason="Waiting for confirmed structure history"; return false;
+   }
+   if(!StructureCacheReady || StructureCacheSize!=ArraySize(Rates) || StructureCacheTime!=Rates[1].time)
+      BuildStructureCache(false);
+   side=StructureSignals[shift].side;
+   setup=StructureSignals[shift].setup;
+   stopAnchor=StructureSignals[shift].stopAnchor;
+   reason=side==0 ? "Waiting: fresh order-block, swing break or trendline rejection" : setup;
+   return side!=0;
 }
 
 void RebuildStructure() {
    ObjectsDeleteAll(0,Prefix+"STRUCT_");
-   ResetStructure();
-   if(!DrawTrendlines && !DrawOrderBlocks && !DrawStructureBreaks) { StructureStatus="Drawing OFF"; return; }
-   // Replay oldest to newest. At each step only candles already closed at that step are read.
-   int oldest=MathMin(StructureLookback,ArraySize(Rates)-2*PivotBars-1);
-   for(int shift=oldest;shift>=1;shift--) ProcessStructureBar(shift);
+   BuildStructureCache(true);
+   if(ArraySize(Rates)<2) { StructureStatus="Waiting for history"; return; }
    if(DrawTrendlines) {
       Trendline(Prefix+"STRUCT_RESISTANCE",PreviousHigh,HighPivot,clrTomato);
       Trendline(Prefix+"STRUCT_SUPPORT",PreviousLow,LowPivot,clrDeepSkyBlue);
@@ -152,3 +290,4 @@ void RebuildStructure() {
       " | pivot delay="+(string)PivotBars+" bars";
    ChartRedraw();
 }
+#endif
