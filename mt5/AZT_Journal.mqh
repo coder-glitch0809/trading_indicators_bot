@@ -1,4 +1,4 @@
-// Signal journal = the AIs' memory. Every live signal is stored with both AI
+// Signal journal = the AIs' memory. Every live signal is stored with Claude
 // verdicts, then scored on real closed candles with the 3-part exit plan.
 // Each AI is shown its own record next time; after a wrong call it writes a lesson.
 // File: MQL5/Files/AZT_Journal_<symbol>_<tf>.csv (one per chart symbol/timeframe).
@@ -35,13 +35,13 @@ void JournalSave() {
    int file=FileOpen(JournalFile(),FILE_WRITE|FILE_CSV|FILE_ANSI,';',CP_UTF8);
    if(file==INVALID_HANDLE) { Print("AZT: cannot write journal ",GetLastError()); return; }
    FileWrite(file,"id","time","side","setup","context","action","entry","sl",
-      "claude","claude_conf","claude_why","gemini","gemini_conf","gemini_why",
+      "claude","claude_conf","claude_why",
       "outcome","stage","resultR","mfeR","maeR","reflected");
    for(int i=0;i<ArraySize(Journal);i++) {
       AZTJournalRow r=Journal[i];
       FileWrite(file,r.id,(long)r.time,r.side,r.setup,r.context,r.action,
          DoubleToString(r.entry,_Digits),DoubleToString(r.sl,_Digits),
-         r.dec[0],r.conf[0],r.why[0],r.dec[1],r.conf[1],r.why[1],
+         r.dec[0],r.conf[0],r.why[0],
          r.outcome,r.stage,DoubleToString(r.resultR,3),DoubleToString(r.mfeR,2),DoubleToString(r.maeR,2),r.reflected);
    }
    FileClose(file);
@@ -51,7 +51,12 @@ void JournalLoad() {
    ArrayResize(Journal,0);
    int file=FileOpen(JournalFile(),FILE_READ|FILE_CSV|FILE_ANSI|FILE_SHARE_READ,';',CP_UTF8);
    if(file==INVALID_HANDLE) return;
-   for(int c=0;c<20 && !FileIsEnding(file);c++) FileReadString(file); // header
+   int columns=0;
+   while(!FileIsEnding(file)) {
+      FileReadString(file); columns++;
+      if(FileIsLineEnding(file)) break;
+   }
+   if(columns!=17 && columns!=20) { FileClose(file); return; }
    while(!FileIsEnding(file)) {
       AZTJournalRow r;
       r.id=FileReadString(file);
@@ -65,6 +70,8 @@ void JournalLoad() {
          r.conf[p]=(int)StringToInteger(FileReadString(file));
          r.why[p]=FileReadString(file);
       }
+      // Skip the retired provider columns in older 20-column journals.
+      if(columns==20) for(int c=0;c<3;c++) FileReadString(file);
       r.outcome=(int)StringToInteger(FileReadString(file));
       r.stage=(int)StringToInteger(FileReadString(file));
       r.resultR=StringToDouble(FileReadString(file));

@@ -1,4 +1,4 @@
-#ifndef AZT_TELEGRAM_MQH
+﻿#ifndef AZT_TELEGRAM_MQH
 #define AZT_TELEGRAM_MQH
 #include "AZT_Json.mqh"
 
@@ -15,6 +15,7 @@ input bool InpTelegramTestOnStart = false; // Explicit opt-in, persisted once
 struct AZTTelegramItem {
    string key;
    string message;
+   string photo; // Owned PNG file, deleted when the queue item is removed
    string markup; // Optional reply_markup JSON (inline buttons)
    datetime expires;
    datetime next_try;
@@ -162,6 +163,7 @@ string AZTTelegramMarker(const string key) {
 }
 
 void AZTTelegramRemove(const int index) {
+   if(AZTTG_Queue[index].photo!="") FileDelete(AZTTG_Queue[index].photo);
    int count=ArraySize(AZTTG_Queue);
    for(int i=index;i<count-1;i++) AZTTG_Queue[i]=AZTTG_Queue[i+1];
    ArrayResize(AZTTG_Queue,count-1);
@@ -177,6 +179,7 @@ bool AZTTelegramQueue(const string stable_key,const string message,const int exp
    for(int i=0;i<count;i++) if(AZTTG_Queue[i].key==stable_key) return false;
    if(count>=8) { AZTTG_Status="Queue full; newest signal skipped"; return false; }
    ArrayResize(AZTTG_Queue,count+1);
+   AZTTG_Queue[count].photo="";
    AZTTG_Queue[count].key=stable_key;
    AZTTG_Queue[count].message=message;
    AZTTG_Queue[count].markup=markup;
@@ -320,6 +323,37 @@ void AZTTelegramPollDecisions() {
    FileClose(lock);
 }
 
+// Multipart encoding keeps binary PNG bytes intact (no URL encoding).
+void AZTTGAppend(char &target[],const string value) {
+   char bytes[]; int n=StringToCharArray(value,bytes,0,WHOLE_ARRAY,CP_UTF8)-1;
+   int at=ArraySize(target); ArrayResize(target,at+n); ArrayCopy(target,bytes,at,0,n);
+}
+bool AZTTGPhotoBody(const AZTTelegramItem &item,char &body[],string &headers) {
+   int file=FileOpen(item.photo,FILE_READ|FILE_BIN);
+   if(file==INVALID_HANDLE) return false;
+   long size=(long)FileSize(file);
+   if(size<1 || size>10000000) { FileClose(file); return false; }
+   char png[]; ArrayResize(png,(int)size);
+   uint read=FileReadArray(file,png,0,(int)size); FileClose(file);
+   if(read!=(uint)size) return false;
+   string boundary="AZT"+AZTTelegramHash(item.key);
+   ArrayResize(body,0);
+   AZTTGAppend(body,"--"+boundary+"\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n"+AZTTG_Chat+"\r\n");
+   AZTTGAppend(body,"--"+boundary+"\r\nContent-Disposition: form-data; name=\"caption\"\r\n\r\n"+item.message+"\r\n");
+   AZTTGAppend(body,"--"+boundary+"\r\nContent-Disposition: form-data; name=\"photo\"; filename=\"signal.png\"\r\nContent-Type: image/png\r\n\r\n");
+   int at=ArraySize(body); ArrayResize(body,at+(int)size); ArrayCopy(body,png,at,0,(int)size);
+   AZTTGAppend(body,"\r\n--"+boundary+"--\r\n");
+   headers="Content-Type: multipart/form-data; boundary="+boundary+"\r\n";
+   return true;
+}
+bool AZTTelegramQueuePhoto(const string key,const string caption,const string filename) {
+   if(StringLen(caption)>1024 || !AZTTelegramQueue(key,caption,180)) return false;
+   int i=ArraySize(AZTTG_Queue)-1;
+   AZTTG_Queue[i].photo=filename;
+   AZTTG_Queue[i].next_try=TimeLocal()+2; // ChartScreenShot is processed by the chart queue.
+   return true;
+}
+
 void AZTTelegramPump() {
    if(AZTTelegramTester() || !AZTTG_Ready) return;
    datetime now=TimeLocal();
@@ -358,12 +392,21 @@ void AZTTelegramPump() {
    char request[],response[];
    int bytes=StringToCharArray(body,request,0,WHOLE_ARRAY,CP_UTF8);
    ArrayResize(request,bytes-1); // Exact body bytes; exclude the trailing NUL.
+   string headers="Content-Type: application/x-www-form-urlencoded\r\n", method="sendMessage";
+   if(AZTTG_Queue[0].photo!="") {
+      if(!AZTTGPhotoBody(AZTTG_Queue[0],request,headers)) {
+         GlobalVariableDel(marker);
+         AZTTG_Status="Signal PNG unavailable; text follows";
+         AZTTelegramRemove(0); FileClose(lock); return;
+      }
+      method="sendPhoto";
+   }
    string response_headers;
    int timeout=MathMax(500,MathMin(InpTelegramTimeoutMs,3000));
    AZTTG_Queue[0].attempts++;
    ResetLastError();
-   int http=WebRequest("POST","https://api.telegram.org/bot"+AZTTG_Token+"/sendMessage",
-      "Content-Type: application/x-www-form-urlencoded\r\n",timeout,request,response,response_headers);
+   int http=WebRequest("POST","https://api.telegram.org/bot"+AZTTG_Token+"/"+method,
+      headers,timeout,request,response,response_headers);
    int error=GetLastError();
    string result=CharArrayToString(response,0,WHOLE_ARRAY,CP_UTF8);
    string ok=AZTTelegramJsonScalar(result,"ok");

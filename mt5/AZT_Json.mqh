@@ -1,6 +1,6 @@
 #ifndef AZT_JSON_MQH
 #define AZT_JSON_MQH
-// Minimal JSON helpers for Telegram / Claude / Gemini responses.
+// Minimal JSON helpers for Telegram / Claude responses.
 // Not a general parser: finds "key": value pairs, decoding string escapes.
 
 string AZTJsonEscape(const string value) {

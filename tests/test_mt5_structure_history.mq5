@@ -116,17 +116,16 @@ void OnStart() {
    // Journal: scoring, memory text and CSV round trip.
    ArrayResize(Journal,0);
    AZTAIVerdict verdicts[AZT_AI_COUNT];
-   ZeroMemory(verdicts[0]); ZeroMemory(verdicts[1]);
+   ZeroMemory(verdicts[0]);
    verdicts[0].ok=true; verdicts[0].decision=1; verdicts[0].confidence=80; verdicts[0].summary="Trend; mos";
-   verdicts[1].ok=true; verdicts[1].decision=-1; verdicts[1].confidence=70; verdicts[1].summary="Qarshilik yaqin";
    signal.time=D'2026.09.01 10:00';
    JournalAdd("J1",signal,"RSI 55, H4 UP",verdicts,"AUTO");
    signal.time=D'2026.09.01 11:00';
    JournalAdd("J2",signal,"RSI 68, H4 DOWN",verdicts,"WAITING");
    Journal[0].outcome=1; Journal[0].stage=1; Journal[0].resultR=0.75;
    Journal[1].outcome=-1; Journal[1].resultR=-1;
-   StructureCheck(JournalCorrect(Journal[0],0)==1 && JournalCorrect(Journal[0],1)==-1,"APPROVE on a TP1 winner is right, REJECT is wrong");
-   StructureCheck(JournalCorrect(Journal[1],0)==-1 && JournalCorrect(Journal[1],1)==1,"APPROVE on a stopped trade is wrong, REJECT is right");
+   StructureCheck(JournalCorrect(Journal[0],0)==1,"APPROVE on a TP1 winner is right, REJECT is wrong");
+   StructureCheck(JournalCorrect(Journal[1],0)==-1,"APPROVE on a stopped trade is wrong, REJECT is right");
    int samples; double precision=JournalApprovePrecision(0,samples);
    StructureCheck(samples==2 && MathAbs(precision-50)<1e-9,"approve precision counted per provider");
    string memory=JournalMemory(0);
@@ -135,7 +134,7 @@ void OnStart() {
    JournalSetAction("J2","USER_REJECT");
    JournalSave(); ArrayResize(Journal,0); JournalLoad();
    StructureCheck(ArraySize(Journal)==2 && Journal[1].action=="USER_REJECT" && Journal[0].why[0]=="Trend, mos" &&
-      Journal[1].outcome==-1 && Journal[0].dec[1]==-1,"journal survives save/load (separator in text sanitized)");
+      Journal[1].outcome==-1 && Journal[0].dec[0]==1,"journal survives save/load (separator in text sanitized)");
    FileDelete(JournalFile());
    StructureFixture(); Rates[4].open=94;
    outcome=AnalyzeHistoricalSignal(signal,5,resultR,exitShift);

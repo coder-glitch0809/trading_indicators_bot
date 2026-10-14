@@ -1,4 +1,4 @@
-// Offline transport tests. The production WebRequest call is replaced at
+﻿// Offline transport tests. The production WebRequest call is replaced at
 // compile time, so running this script cannot contact Telegram or open trades.
 #property strict
 int FakeHTTP=200, FakeError=0, FakeCalls=0;
@@ -90,6 +90,19 @@ void OnStart() {
    Check(AZTTelegramRequestTest(),"explicit test queued"); AZTTelegramPump();
    Check(FakeCalls==1 && !AZTTelegramRequestTest(),"explicit test sent once across repeated triggers");
 
+   // Binary multipart upload and owned-file cleanup, no external requests.
+   Fixture();
+   string photo="azt_test_photo.png";
+   int pf=FileOpen(photo,FILE_WRITE|FILE_BIN);
+   uchar raw[]={137,80,78,71,0,13,10,255}; FileWriteArray(pf,raw); FileClose(pf);
+   Check(AZTTelegramQueuePhoto("photo-test","BUY EURUSD",photo),"photo queued");
+   char multipart[]; string headers;
+   Check(AZTTGPhotoBody(AZTTG_Queue[0],multipart,headers) && StringFind(headers,"multipart/form-data")>=0,"multipart PNG body built");
+   string encoded=CharArrayToString(multipart,0,WHOLE_ARRAY,CP_UTF8);
+   Check(StringFind(encoded,"name=\"caption\"")>=0 && StringFind(encoded,"filename=\"signal.png\"")>=0,"photo fields have caption and filename");
+   AZTTG_Queue[0].next_try=0; AZTTelegramPump();
+   Check(FakeCalls==1 && ArraySize(AZTTG_Queue)==0 && !FileIsExist(photo),"photo sent and file cleaned");
+
    // JSON helpers and AI verdict parsing.
    Check(AZTJsonString("{\"a\":\"x \\\"q\\\" \\u0041\\n\"}","a")=="x \"q\" A\n","JSON string escapes decoded");
    Check(AZTJsonEscape("a\"b\\c\nd")=="a\\\"b\\\\c\\nd","JSON string escaped");
@@ -102,12 +115,12 @@ void OnStart() {
    Check(!verdict.ok,"free text is not treated as approval");
 
    // Lessons file keeps the newest entries for each provider.
-   FileDelete(AZTLessonsFile(AZT_AI_GEMINI));
-   for(int i=0;i<35;i++) AZTLessonsAdd(AZT_AI_GEMINI,"lesson "+(string)i+"\nline");
+   FileDelete(AZTLessonsFile(AZT_AI_CLAUDE));
+   for(int i=0;i<35;i++) AZTLessonsAdd(AZT_AI_CLAUDE,"lesson "+(string)i+"\nline");
    string lessons[];
-   Check(AZTLessonsRead(AZT_AI_GEMINI,lessons)==30 && StringFind(lessons[29],"lesson 34 line")>0,"lessons capped at newest 30, one line each");
-   Check(StringFind(AZTLessonsText(AZT_AI_GEMINI,3),"lesson 32")>0 && StringFind(AZTLessonsText(AZT_AI_GEMINI,3),"lesson 31")<0,"prompt shows newest lessons");
-   FileDelete(AZTLessonsFile(AZT_AI_GEMINI));
+   Check(AZTLessonsRead(AZT_AI_CLAUDE,lessons)==30 && StringFind(lessons[29],"lesson 34 line")>0,"lessons capped at newest 30, one line each");
+   Check(StringFind(AZTLessonsText(AZT_AI_CLAUDE,3),"lesson 32")>0 && StringFind(AZTLessonsText(AZT_AI_CLAUDE,3),"lesson 31")<0,"prompt shows newest lessons");
+   FileDelete(AZTLessonsFile(AZT_AI_CLAUDE));
 
    // Approval buttons and getUpdates polling.
    Fixture();

@@ -14,7 +14,7 @@ AI Zone Trader - Windows VPS ga o'rnatish
       [x] Allow WebRequest for listed URL:
             https://api.telegram.org
             https://api.anthropic.com
-            https://generativelanguage.googleapis.com
+         
 6. Navigator > Expert Advisors > Refresh > AI_Zone_Trader > AI_Zone_Trader_EA ni
    chartga torting (masalan EURUSD M15). Inputs: Reset, sinov uchun
    TradeMode = AZT_CONFIRM_EVERY. Tepadagi "Algo Trading" yashil bo'lsin.

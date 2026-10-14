@@ -1,15 +1,15 @@
-// AI Zone Trader: everything runs inside MetaTrader 5.
-// Rule-based signals -> Claude + Gemini review (they learn from their own record)
+﻿// AI Zone Trader: everything runs inside MetaTrader 5.
+// Rule-based signals -> Claude review (they learn from their own record)
 // -> Telegram signal / approval buttons -> order with SL and 3-part take profit.
 #property strict
 #property version "4.00"
-#property description "MT5 signals + Claude/Gemini review + Telegram approval. SL and 3-part TP (50% at 1.5R, 25% at 2.25R, 25% at 3R)."
+#property description "MT5 signals + Claude review + Telegram approval. SL and 3-part TP (50% at 1.5R, 25% at 2.25R, 25% at 3R)."
 #include <Trade/Trade.mqh>
 
 enum AZTTradeMode {
    AZT_SIGNALS_ONLY=0,   // Faqat signal: savdo ochilmaydi
    AZT_CONFIRM_EVERY=1,  // Har savdo Telegram tugmasi bilan tasdiqlanadi
-   AZT_AI_HYBRID=2       // Ikkala AI tasdiqlasa o'zi kiradi, aks holda sizdan so'raydi
+   AZT_AI_HYBRID=2       // Claude tasdiqlasa o'zi kiradi, aks holda sizdan so'raydi
 };
 
 input group "1. Savdo rejimi"
@@ -23,7 +23,7 @@ input double MinLotMaxRiskPercent = 3.0; // Kichik hisob: min lot riski shu %gac
 input double MaxDailyLossPercent = 3.0;
 input double MaxDrawdownPercent = 10.0;
 input int MaxConsecutiveLosses = 3;
-input int MaxOpenPositions = 1;          // Hisob bo'yicha pozitsiya + kutilayotgan orderlar
+input int MaxOpenPositions = 3;          // Hisob bo'yicha pozitsiya + kutilayotgan orderlar
 input double MaxSpreadPoints = 25.0;     // Broker point birligida
 input double MaxEntryDriftATR = 0.5;     // Narx signaldan shuncha ATR qochsa kirmaydi
 input int SlippagePoints = 30;
@@ -272,7 +272,7 @@ void DrawSignal(const LocalSignal &signal, bool historical) {
 
 string ModeName() {
    return TradeMode==AZT_SIGNALS_ONLY ? "FAQAT SIGNAL" :
-          TradeMode==AZT_CONFIRM_EVERY ? "HAR SAVDO TASDIQ BILAN" : "AI HYBRID (2 AI rozi bo'lsa o'zi, aks holda tasdiq)";
+          TradeMode==AZT_CONFIRM_EVERY ? "HAR SAVDO TASDIQ BILAN" : "AI HYBRID (Claude rozi bo'lsa o'zi, aks holda tasdiq)";
 }
 
 // UP / DOWN / MIXED on the last closed higher-timeframe candle.
@@ -415,6 +415,8 @@ string SignalText(const LocalSignal &signal, bool volumeOk, double volume, doubl
    return text;
 }
 
+#include "AZT_SignalImage.mqh"
+
 void Notify(const string key, const string text, const string markup="") {
    Print("AZT: ",text);
    AZTTelegramQueue(key,AZTTrimTo(text,4000),300,markup);
@@ -432,7 +434,7 @@ void Panel() {
       "\nRisk: ",DoubleToString(MaxRiskPercent,1),"% | TP: ",DoubleToString(TP1ClosePercent,0),"% @",DoubleToString(TP1_R,2),
       "R, ",DoubleToString(TP2ClosePercent,0),"% @",DoubleToString(TP2_R,2),"R, rest @",DoubleToString(TP3_R,2),"R",
       "\nAI: ",AZTAIStatus(),(AITestStatus!="" ? "\nAI test: "+AITestStatus : ""),
-      "\n",JournalScore(AZT_AI_CLAUDE),"\n",JournalScore(AZT_AI_GEMINI),
+      "\n",JournalScore(AZT_AI_CLAUDE),
       Pending.active ? "\nTELEGRAM TASDIG'I KUTILMOQDA: "+Pending.id : "",
       "\n",Status,"\nLast closed candle: ",TimeToString(LastClosedBar),
       "\nSpread: ",spread," | Order limit: ",DoubleToString(MaxSpreadPoints,1),
@@ -472,13 +474,28 @@ bool DailyRiskSafe(string &reason) {
 
 string PosKey(ulong ticket) { return "AZTP."+PosScope+"."+(string)ticket; }
 
+bool AZTPositionSlotAvailable(int positions,int orders,int limit,bool hedging,bool sameSymbol) {
+   return positions+orders<limit && (hedging || !sameSymbol);
+}
 bool AutoOrder(const LocalSignal &signal, string &reason) {
+   // Serialize this EA's entries across charts before checking the account cap.
+   string file="AZT_order_"+(string)AccountInfoInteger(ACCOUNT_LOGIN)+".lock";
+   int lock=FileOpen(file,FILE_READ|FILE_WRITE|FILE_BIN);
+   if(lock==INVALID_HANDLE) { reason="Boshqa chart order ochmoqda; bu signal o'tkazildi"; return false; }
+   bool ok=AutoOrderLocked(signal,reason);
+   FileClose(lock);
+   return ok;
+}
+bool AutoOrderLocked(const LocalSignal &signal, string &reason) {
    if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) || !MQLInfoInteger(MQL_TRADE_ALLOWED) ||
       !AccountInfoInteger(ACCOUNT_TRADE_ALLOWED) || !AccountInfoInteger(ACCOUNT_TRADE_EXPERT)) {
       reason="MT5 da Algo Trading tugmasi yoki EA savdo ruxsati O'CHIQ"; return false;
    }
-   if(PositionSelect(_Symbol) || PositionsTotal()+OrdersTotal()>=MaxOpenPositions) {
+   if(!AZTPositionSlotAvailable(PositionsTotal(),OrdersTotal(),MaxOpenPositions,true,false)) {
       reason="Ochiq pozitsiya/order limiti ("+(string)MaxOpenPositions+")"; return false;
+   }
+   if(AccountInfoInteger(ACCOUNT_MARGIN_MODE)!=ACCOUNT_MARGIN_MODE_RETAIL_HEDGING && PositionSelect(_Symbol)) {
+      reason="Bu symbol ochiq: alohida parallel pozitsiyalar uchun hedging hisob kerak"; return false;
    }
    MqlTick tick;
    if(!SymbolInfoTick(_Symbol,tick) || tick.ask<=0 || tick.bid<=0) { reason="Narx yo'q"; return false; }
@@ -513,10 +530,12 @@ bool AutoOrder(const LocalSignal &signal, string &reason) {
    }
    // Remember the original risk so TP1/TP2 management survives EA restarts.
    double open=entry, filled=volume;
-   ulong ticket=0;
+   ulong ticket=0, positionId=0;
+   if(Trade.ResultDeal()>0 && HistoryDealSelect(Trade.ResultDeal()))
+      positionId=(ulong)HistoryDealGetInteger(Trade.ResultDeal(),DEAL_POSITION_ID);
    for(int i=PositionsTotal()-1;i>=0;i--) {
       ulong t=PositionGetTicket(i);
-      if(t>0 && PositionGetString(POSITION_SYMBOL)==_Symbol && PositionGetInteger(POSITION_MAGIC)==(long)MagicNumber) {
+      if(t>0 && (t==Trade.ResultOrder() || (positionId>0 && (ulong)PositionGetInteger(POSITION_IDENTIFIER)==positionId)) && PositionGetString(POSITION_SYMBOL)==_Symbol && PositionGetInteger(POSITION_MAGIC)==(long)MagicNumber) {
          ticket=t; open=PositionGetDouble(POSITION_PRICE_OPEN); filled=PositionGetDouble(POSITION_VOLUME); break;
       }
    }
@@ -680,6 +699,7 @@ void HandleSignal(const LocalSignal &signal) {
       if(TradeMode!=AZT_SIGNALS_ONLY) TradeStatus=(AutoOrder(signal,reason) ? "" : "Order skipped: ")+reason;
       return;
    }
+   QueueSignalImage(signal,key);
    string text=SignalText(signal,volumeOk,volume,riskMoney,volumeReason);
    AZTAIVerdict verdicts[AZT_AI_COUNT];
    for(int p=0;p<AZT_AI_COUNT;p++) ZeroMemory(verdicts[p]);
@@ -732,13 +752,17 @@ void HandleSignal(const LocalSignal &signal) {
       bool ok=AutoOrder(signal,reason);
       TradeStatus=(ok ? "AI auto: " : "AI auto skipped: ")+reason;
       JournalAdd(id,signal,context,verdicts,ok ? "AUTO" : "AUTO_FAILED");
-      Notify(key,text+"\n\n"+(ok ? "✅ Ikkala AI tasdiqladi → " : "⚠️ AI tasdiqladi, lekin order ochilmadi: ")+reason);
+      Notify(key,text+"\n\n"+(ok ? "✅ Claude tasdiqladi → " : "⚠️ AI tasdiqladi, lekin order ochilmadi: ")+reason);
       return;
    }
    if(!AZTTelegramReady()) {
       TradeStatus="Tasdiq kerak, lekin Telegram ulanmagan: savdo yo'q";
       JournalAdd(id,signal,context,verdicts,"NO_TELEGRAM");
       return;
+   }
+   if(Pending.active) {
+      JournalSetAction(Pending.id,"SUPERSEDED");
+      Notify("sup|"+Pending.id,"Avvalgi tasdiq so'rovi yangi signal bilan almashtirildi: "+Pending.id);
    }
    Pending.active=true; Pending.id=id; Pending.signal=signal;
    Pending.expires=TimeLocal()+ApprovalTimeoutMinutes*60;
@@ -818,9 +842,9 @@ void RunAITest() {
    AITestStatus="tekshirilmoqda...";
    Panel();
    AZTAIInit();
-   string claude=AZTAIPing(AZT_AI_CLAUDE), gemini=AZTAIPing(AZT_AI_GEMINI);
-   AITestStatus=claude+" | "+gemini;
-   Notify("aitest|"+(string)(long)TimeLocal(),"🧪 AI TEST | "+_Symbol+"\n"+claude+"\n"+gemini+
+   string claude=AZTAIPing(AZT_AI_CLAUDE);
+   AITestStatus=claude;
+   Notify("aitest|"+(string)(long)TimeLocal(),"🧪 AI TEST | "+_Symbol+"\n"+claude+
       "\nBu savdo signali emas.");
 }
 
@@ -884,7 +908,7 @@ int OnInit() {
       }
       JournalLoad();
       Button(Prefix+"TELEGRAM_TEST",25,"Telegram TEST (tugmali)");
-      Button(Prefix+"AI_TEST",55,"AI TEST (Claude+Gemini)");
+      Button(Prefix+"AI_TEST",55,"AI TEST (Claude)");
       if(TradeMode!=AZT_SIGNALS_ONLY && !AZTTelegramReady())
          Print("AZT: WARNING - Telegram is not ready, so trades needing your approval cannot open.");
    }

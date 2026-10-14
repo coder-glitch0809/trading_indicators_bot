@@ -1,4 +1,4 @@
-// Runs the production signal evaluator on controlled candles. No trading calls.
+﻿// Runs the production signal evaluator on controlled candles. No trading calls.
 #define OnInit EA_OnInit
 #define OnDeinit EA_OnDeinit
 #define OnTick EA_OnTick
@@ -34,6 +34,12 @@ void Fixture(bool buy=true) {
    }
 }
 void OnStart() {
+   Check(AZTPositionSlotAvailable(1,0,3,true,true),"hedging allows second signal on same symbol");
+   Check(AZTPositionSlotAvailable(2,0,3,true,true),"hedging allows third position");
+   Check(!AZTPositionSlotAvailable(3,0,3,true,true),"fourth position blocked at cap");
+   Check(!AZTPositionSlotAvailable(2,1,3,true,false),"pending order occupies a slot");
+   Check(!AZTPositionSlotAvailable(1,0,3,false,true),"netting cannot merge a new signal into existing symbol");
+   Check(AZTPositionSlotAvailable(1,0,3,false,false),"netting allows another symbol within cap");
    LocalSignal signal; string reason;
    Fixture();
    Check(TradeMode!=AZT_SIGNALS_ONLY && TP3_R>=3.0,"default mode asks AI/approval and targets 1:3");

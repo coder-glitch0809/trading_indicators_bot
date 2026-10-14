@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$TerminalDataPath,
     [string[]]$LegacyEnv = @(
         (Join-Path $PSScriptRoot '..\.private\legacy-server.env'),
@@ -6,7 +6,7 @@ param(
 )
 # Installs AI Zone Trader into MetaTrader 5:
 #   MQL5\Experts\AI_Zone_Trader\  <- EA (.ex5) and its source modules
-#   MQL5\Files\AZT_Config.ini     <- Telegram token/chat and Claude/Gemini API keys (private)
+#   MQL5\Files\AZT_Config.ini     <- Telegram token/chat and Claude API keys (private)
 # Old copies (Experts root, AZT_Telegram.ini, old preset) are moved to MQL5\Files\AZT_Backup_*.
 # Secret values are never printed.
 $ErrorActionPreference = 'Stop'
@@ -26,7 +26,7 @@ if (-not (Test-Path -LiteralPath (Join-Path $resolved 'MQL5') -PathType Containe
     throw 'Target must be an existing MT5 data folder containing MQL5.'
 }
 $artifacts = @('AI_Zone_Trader_EA.ex5','AI_Zone_Trader_EA.mq5','AZT_Structure.mqh','AZT_History.mqh',
-               'AZT_Telegram.mqh','AZT_Json.mqh','AZT_AI.mqh','AZT_Journal.mqh','AZT_Confluence.mqh')
+               'AZT_Telegram.mqh','AZT_Json.mqh','AZT_AI.mqh','AZT_Journal.mqh','AZT_Confluence.mqh','AZT_SignalImage.mqh')
 foreach ($file in $artifacts) {
     if (-not (Test-Path -LiteralPath (Join-Path $PSScriptRoot $file))) { throw "Missing file: $file" }
 }
@@ -39,7 +39,7 @@ New-Item -ItemType Directory -Path $backup | Out-Null
 
 # 1. Remove old copies so Navigator shows exactly one AI_Zone_Trader_EA.
 $old = @('AI_Zone_Trader_EA.ex5','AI_Zone_Trader_EA.mq5','AI_Zone_Trader_Server_EA.ex5','AI_Zone_Trader_Server_EA.mq5',
-         'AZT_Structure.mqh','AZT_History.mqh','AZT_Telegram.mqh','AZT_Json.mqh','AZT_AI.mqh','AZT_Journal.mqh','AZT_Confluence.mqh')
+         'AZT_Structure.mqh','AZT_History.mqh','AZT_Telegram.mqh','AZT_Json.mqh','AZT_AI.mqh','AZT_Journal.mqh','AZT_Confluence.mqh','AZT_SignalImage.mqh')
 foreach ($file in $old) {
     $path = Join-Path $expertsRoot $file
     if (Test-Path -LiteralPath $path) { Move-Item -LiteralPath $path -Destination (Join-Path $backup $file) -Force }
@@ -71,7 +71,7 @@ $oldTelegram = Join-Path $files 'AZT_Telegram.ini'
 # A filled AZT_Config.ini placed next to this script (e.g. copied to a VPS) is imported too.
 $sources = @($config, (Join-Path $PSScriptRoot 'AZT_Config.ini'), $oldTelegram) + $LegacyEnv
 $aliases = @{ 'ANTHROPIC_API_KEY' = 'CLAUDE_API_KEY'; 'BOT_TOKEN' = 'TELEGRAM_BOT_TOKEN'; 'CHAT_ID' = 'TELEGRAM_CHAT_ID' }
-$keys = @('TELEGRAM_BOT_TOKEN','TELEGRAM_CHAT_ID','TELEGRAM_ADMIN_ID','CLAUDE_API_KEY','GEMINI_API_KEY','CLAUDE_MODEL','GEMINI_MODEL')
+$keys = @('TELEGRAM_BOT_TOKEN','TELEGRAM_CHAT_ID','TELEGRAM_ADMIN_ID','CLAUDE_API_KEY','CLAUDE_MODEL')
 $values = @{}
 foreach ($source in $sources) {
     $settings = Read-Settings $source
@@ -96,23 +96,20 @@ TELEGRAM_ADMIN_ID=$($values['TELEGRAM_ADMIN_ID'])
 
 # Claude: https://console.anthropic.com/settings/keys
 CLAUDE_API_KEY=$($values['CLAUDE_API_KEY'])
-# Gemini: https://aistudio.google.com/apikey
-GEMINI_API_KEY=$($values['GEMINI_API_KEY'])
 
-# Optional model names (empty = claude-sonnet-5-5 / gemini-2.5-flash).
+# Optional model names (empty = claude-sonnet-5-5).
 CLAUDE_MODEL=$($values['CLAUDE_MODEL'])
-GEMINI_MODEL=$($values['GEMINI_MODEL'])
 "@
 [IO.File]::WriteAllText($config, $text, [Text.UTF8Encoding]::new($false))
 if (Test-Path -LiteralPath $oldTelegram) { Move-Item -LiteralPath $oldTelegram -Destination (Join-Path $backup 'AZT_Telegram.ini') -Force }
 
 Write-Output "EA installed:     $experts"
 Write-Output "Settings file:    $config"
-foreach ($key in @('TELEGRAM_BOT_TOKEN','TELEGRAM_CHAT_ID','CLAUDE_API_KEY','GEMINI_API_KEY')) {
+foreach ($key in @('TELEGRAM_BOT_TOKEN','TELEGRAM_CHAT_ID','CLAUDE_API_KEY')) {
     $state = if ($values.ContainsKey($key)) { 'filled' } else { 'EMPTY - fill it in' }
     Write-Output ("  {0,-19} {1}" -f $key, $state)
 }
 Write-Output "Old copies moved: $backup"
 Write-Output 'Next in MT5: Tools > Options > Expert Advisors > Allow WebRequest for:'
-Write-Output '  https://api.telegram.org   https://api.anthropic.com   https://generativelanguage.googleapis.com'
+Write-Output '  https://api.telegram.org   https://api.anthropic.com'
 Write-Output 'Then: Navigator > Expert Advisors > Refresh > AI_Zone_Trader > AI_Zone_Trader_EA onto a chart.'

@@ -1,7 +1,7 @@
-# AI Zone Trader — MT5 qo'llanma
+﻿# AI Zone Trader — MT5 qo'llanma
 
 Hamma narsa MetaTrader 5 ichida ishlaydi. Server, TradingView yoki Python
-kerak emas. EA o'zi signal topadi, Claude va Gemini'dan fikr so'raydi,
+kerak emas. EA o'zi signal topadi, Claude'dan fikr so'raydi,
 Telegram'ga yuboradi, kerak bo'lsa sizdan tasdiq oladi va savdoni 3 qismda
 boshqaradi.
 
@@ -10,7 +10,7 @@ boshqaradi.
 | Fayl | MT5 ichidagi joyi | Nima uchun |
 |---|---|---|
 | `AI_Zone_Trader_EA.ex5` + `AI_Zone_Trader_EA.mq5` + 6 ta `AZT_*.mqh` | `MQL5\Experts\AI_Zone_Trader\` | Robotning o'zi |
-| `AZT_Config.ini` | `MQL5\Files\` | **Barcha kalitlar shu yerda:** Telegram token, chat ID, Claude va Gemini API kalitlari |
+| `AZT_Config.ini` | `MQL5\Files\` | **Barcha kalitlar shu yerda:** Telegram token, chat ID, Claude API kalitlari |
 
 Boshqa hech narsa kerak emas. Buni `Install-MT5.ps1` avtomatik qiladi:
 
@@ -21,7 +21,7 @@ powershell -ExecutionPolicy Bypass -File .\mt5\Install-MT5.ps1
 U eski nusxalarni (Experts papkasi ildizidagi eski EA, `AZT_Telegram.ini`,
 eski preset) `MQL5\Files\AZT_Backup_*` ga ko'chiradi, Navigator'da bitta EA qoladi.
 
-## 2. Claude va Gemini kalitlari qayerga qo'yiladi
+## 2. Claude kalitlari qayerga qo'yiladi
 
 Faqat bitta fayl: **MT5 → File → Open Data Folder → MQL5 → Files → `AZT_Config.ini`**.
 Notepad bilan oching:
@@ -31,9 +31,7 @@ TELEGRAM_BOT_TOKEN=123456:ABC...      ← @BotFather bergan token
 TELEGRAM_CHAT_ID=123456789            ← signal keladigan chat
 TELEGRAM_ADMIN_ID=                    ← ixtiyoriy: faqat shu odam tugma bosa oladi (guruhda shart)
 CLAUDE_API_KEY=sk-ant-...             ← https://console.anthropic.com/settings/keys
-GEMINI_API_KEY=AIza...                ← https://aistudio.google.com/apikey
 CLAUDE_MODEL=                         ← bo'sh = claude-sonnet-5-5
-GEMINI_MODEL=                         ← bo'sh = gemini-2.5-flash
 ```
 
 Qoidalar: qo'shtirnoqsiz, bo'sh joysiz. O'zgartirgandan keyin EA'ni chartdan olib
@@ -44,16 +42,15 @@ EA inputlarida kalit kiritiladigan joy **yo'q** — chalkashlik bo'lmasligi uchu
 
 1. **Tools → Options → Expert Advisors**:
    - ✅ Allow algorithmic trading
-   - ✅ Allow WebRequest for listed URL — uchala manzilni qo'shing:
+   - ✅ Allow WebRequest for listed URL — ikkala manzilni qo'shing:
      - `https://api.telegram.org`
      - `https://api.anthropic.com`
-     - `https://generativelanguage.googleapis.com`
 2. Tepadagi **Algo Trading** tugmasi yashil bo'lsin.
 3. **Navigator → Expert Advisors → Refresh → AI_Zone_Trader → AI_Zone_Trader_EA**
    ni kerakli symbol chartiga (masalan EURUSD M15) torting. Inputs'da **Reset** bosing.
 4. Chartning o'ng tomonidagi tugmalar:
    - **Telegram TEST (once)** — Telegram'ga test xabar keladi.
-   - **AI TEST (Claude+Gemini)** — ikkala AI ulanganini tekshiradi; natija panelda
+   - **AI TEST (Claude)** — Claude ulanganini tekshiradi; natija panelda
      va Telegram'da: `✅ ishlayapti` yoki xato sababi (kalit noto'g'ri, model
      topilmadi, balans tugagan, WebRequest ruxsati yo'q).
 
@@ -61,7 +58,7 @@ EA inputlarida kalit kiritiladigan joy **yo'q** — chalkashlik bo'lmasligi uchu
 
 | Rejim | Nima bo'ladi |
 |---|---|
-| `AZT_AI_HYBRID` (standart) | Ikkala AI `APPROVE` va ishonch ≥ 75% → EA **o'zi kiradi**. AI'lar kelishmasa, ishonch past bo'lsa yoki AI javob bermasa → Telegram'da **✅ KIRISH / ❌ BEKOR**, siz bosmaguncha savdo yo'q. |
+| `AZT_AI_HYBRID` (standart) | Claude `APPROVE` va ishonch ≥ 75% → EA **o'zi kiradi**. ishonch past bo'lsa yoki AI javob bermasa → Telegram'da **✅ KIRISH / ❌ BEKOR**, siz bosmaguncha savdo yo'q. |
 | `AZT_CONFIRM_EVERY` | Har bir savdo faqat sizning tugmangiz bilan. Sinov davri uchun eng xavfsiz. |
 | `AZT_SIGNALS_ONLY` | Faqat signal va tahlil, savdo umuman ochilmaydi. |
 
@@ -108,7 +105,7 @@ Foizlar va darajalar `3. Stop loss va 3 qismli take profit` inputlarida o'zgarti
 
 1. **📊 SIGNAL** — yo'nalish, setup, Entry, SL (pt/pips), TP1/TP2/TP3 narxlari
    va qancha yopilishi, lot, risk ($ va %), kutilgan foyda, H4/D1 trendi, RSI,
-   Claude va Gemini xulosasi (o'zbekcha) va ishonch foizi.
+   Claude xulosasi (o'zbekcha) va ishonch foizi.
 2. Kerak bo'lsa **✅ KIRISH / ❌ BEKOR** tugmalari.
 3. **Order ochildi** — haqiqiy kirish narxi, lot, SL, TP darajalari.
 4. **🎯 TP1 / TP2** — qancha lot yopildi, SL qayerga ko'chdi.
@@ -119,13 +116,12 @@ Foizlar va darajalar `3. Stop loss va 3 qismli take profit` inputlarida o'zgarti
 ## 8. AI o'z ustida qanday ishlaydi
 
 - Har bir signal `MQL5\Files\AZT_Journal_<SYMBOL>_<TF>.csv` jurnaliga yoziladi:
-  Claude va Gemini qarori, ishonchi, sababi.
+  Claude qarori, ishonchi, sababi.
 - Keyingi shamlarda EA natijani hisoblaydi: TP1 gacha yetdimi yoki avval SL urildimi.
   APPROVE + TP1 = to'g'ri; REJECT + SL = to'g'ri; aksincha — xato.
 - **Har bir AI keyingi signalda o'zining natijalarini ko'radi** (so'nggi 15 ta
   to'g'ri/xato qarori va umumiy aniqligi).
-- **Xato qilgan AI o'ziga saboq yozadi** (`AZT_Lessons_Claude.txt`,
-  `AZT_Lessons_Gemini.txt`, oxirgi 30 tasi saqlanadi) va keyingi tahlillarda
+- **Xato qilgan AI o'ziga saboq yozadi** (`AZT_Lessons_Claude.txt`, oxirgi 30 tasi saqlanadi) va keyingi tahlillarda
   shu saboqlarni qo'llaydi.
 - Panelda har bir AI aniqligi ko'rinadi: `Claude: to'g'ri 12/18 (67%) | APPROVE 7/10 | REJECT 5/8`.
 
@@ -148,7 +144,7 @@ chiziqlari chiziladi. Tarixiy signallar faqat statistikaga kiradi, order ochmayd
 |---|---|
 | `Allow https://... in Tools > Options` | 3-bo'limdagi WebRequest manzillarini qo'shing |
 | `API kalit noto'g'ri (HTTP 401)` | `AZT_Config.ini` dagi kalitni yangilang |
-| `Model topilmadi (HTTP 404)` | `CLAUDE_MODEL=` / `GEMINI_MODEL=` ga amaldagi model nomini yozing |
+| `Model topilmadi (HTTP 404)` | `CLAUDE_MODEL=` ga amaldagi model nomini yozing |
 | `Limit/balans tugagan (HTTP 429)` | Provayder hisobini to'ldiring |
 | `getUpdates 409` | Bot webhook'ga ulangan: brauzerda bir marta `https://api.telegram.org/bot<TOKEN>/deleteWebhook` |
 | `Algo Trading ... O'CHIQ` | Tepadagi Algo Trading tugmasini yoqing |
@@ -156,3 +152,14 @@ chiziqlari chiziladi. Tarixiy signallar faqat statistikaga kiradi, order ochmayd
 
 Strategy Tester'da AI va Telegram ishlamaydi; u yerda order faqat qoidalar
 bo'yicha ochiladi va TP1/TP2 boshqaruvi ham sinaladi.
+
+
+## Rasmli signal va parallel pozitsiyalar
+
+- `InpSignalImages=true`: Telegram avval 1600x900 PNG grafikni, keyin batafsil signal va mavjud tasdiq tugmalarini yuboradi. Grafikda haqiqiy MT5 shamlari, Entry/SL/TP1/TP2/TP3, mavjud SNR va trend chiziqlari bor. Narxlar signal paytidagi reja; haqiqiy order kirish narxi alohida xabarda keladi.
+- `MaxOpenPositions=3`: har yangi signalga bittadan order, hisob bo'yicha jami 3 ta pozitsiya/kutilayotgan ordergacha. Bir signal birdaniga 3 ta order ochmaydi. Input orqali limitni oshirish mumkin.
+- Bir instrumentda mustaqil parallel pozitsiyalar uchun hedging hisob kerak. Netting hisobda shu instrumentdagi ochiq pozitsiyaga yangi signal qo'shilmaydi; boshqa instrumentga kirish mumkin.
+- Har pozitsiyaning TP bosqichi va SL boshqaruvi o'z ticketiga bog'langan. Risk, spread, margin va kunlik limit tekshiruvlari har kirishda ishlaydi.
+- Eski chart inputlari avtomatik yangilanmaydi: yangi EX5 ni o'rnatgach `MaxOpenPositions=3`, `InpSignalImages=true` qo'ying.
+- Bitta chartda yangi tasdiq so'rovi kelganda javobsiz eski so'rov bekor qilinadi va Telegram xabari beriladi.
+- Rasm yaratish/yuborish muvaffaqiyatsiz bo'lsa, batafsil matn navbatda qoladi. Jonli Telegram yetkazilishi va brokerdagi parallel orderlar offline test bilan tasdiqlanmaydi.

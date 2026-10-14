@@ -1,23 +1,21 @@
 #ifndef AZT_AI_MQH
 #define AZT_AI_MQH
-// Claude and Gemini review every rule-based signal and learn from their own
+// Claude review every rule-based signal and learn from their own
 // mistakes: each provider sees its own track record and its own lessons file.
 // Keys and optional model names live in MQL5/Files/AZT_Config.ini:
-//   CLAUDE_API_KEY, GEMINI_API_KEY, CLAUDE_MODEL, GEMINI_MODEL
-// MT5 must allow WebRequest to https://api.anthropic.com and
-// https://generativelanguage.googleapis.com. Disabled in Strategy Tester.
+//   CLAUDE_API_KEY, CLAUDE_MODEL
+// MT5 must allow WebRequest to https://api.anthropic.com. Disabled in Strategy Tester.
 #include "AZT_Json.mqh"
 
-input group "8. AI (Claude + Gemini)"
+input group "8. AI (Claude)"
 input bool InpAIEnabled = true;
 input int InpAITimeoutMs = 25000;          // Per provider; the EA waits meanwhile
-input int InpAIAutoConfidence = 75;        // Hybrid: both AIs >= this => trades alone
+input int InpAIAutoConfidence = 75;        // Hybrid: Claude confidence >= this => trades alone
 input double InpAIMinPrecision = 50;       // Hybrid: AI with worse recent APPROVE accuracy (%) must ask you
 input bool InpAILearnFromMistakes = true;  // After a wrong call the AI writes itself a lesson
 
-#define AZT_AI_COUNT 2
+#define AZT_AI_COUNT 1
 #define AZT_AI_CLAUDE 0
-#define AZT_AI_GEMINI 1
 
 struct AZTAIVerdict {
    bool ok;            // Provider answered with a parseable verdict
@@ -48,13 +46,13 @@ const string AZT_AI_REFLECT=
    "trend, distance to an opposing level, RSI extremes, setup type or session). No generic advice. "
    "Answer with ONLY this JSON: {\"lesson\":\"max 200 chars, Uzbek (Latin script)\"}";
 
-string AZTAIName(const int provider) { return provider==AZT_AI_CLAUDE ? "Claude" : "Gemini"; }
+string AZTAIName(const int provider) { return "Claude"; }
 
 bool AZTAITester() { return MQLInfoInteger(MQL_TESTER) || MQLInfoInteger(MQL_OPTIMIZATION); }
 
 bool AZTAIHasKey(const int provider) { return AZTAI_Key[provider]!=""; }
 
-int AZTAIProviders() { return (AZTAIHasKey(0) ? 1 : 0)+(AZTAIHasKey(1) ? 1 : 0); }
+int AZTAIProviders() { return AZTAIHasKey(AZT_AI_CLAUDE) ? 1 : 0; }
 
 string AZTAIStatus() { return AZTAI_Status; }
 
@@ -64,11 +62,8 @@ void AZTAIInit() {
    if(!InpAIEnabled) { AZTAI_Status="OFF"; return; }
    AZTAI_Key[AZT_AI_CLAUDE]=AZTConfigValue("CLAUDE_API_KEY");
    if(AZTAI_Key[AZT_AI_CLAUDE]=="") AZTAI_Key[AZT_AI_CLAUDE]=AZTConfigValue("ANTHROPIC_API_KEY");
-   AZTAI_Key[AZT_AI_GEMINI]=AZTConfigValue("GEMINI_API_KEY");
    AZTAI_Model[AZT_AI_CLAUDE]=AZTConfigValue("CLAUDE_MODEL");
-   AZTAI_Model[AZT_AI_GEMINI]=AZTConfigValue("GEMINI_MODEL");
    if(AZTAI_Model[AZT_AI_CLAUDE]=="") AZTAI_Model[AZT_AI_CLAUDE]="claude-sonnet-5-5";
-   if(AZTAI_Model[AZT_AI_GEMINI]=="") AZTAI_Model[AZT_AI_GEMINI]="gemini-2.5-flash";
    AZTAI_Status="";
    for(int i=0;i<AZT_AI_COUNT;i++)
       AZTAI_Status+=(i>0 ? " | " : "")+AZTAIName(i)+" "+(AZTAIHasKey(i) ? AZTAI_Model[i] : "NO KEY");
@@ -102,24 +97,15 @@ bool AZTAIAsk(const int provider,const string system,const string prompt,const i
    if(!AZTAIHasKey(provider)) { error="no key"; return false; }
    string body, headers, url, host, result;
    int err;
-   if(provider==AZT_AI_CLAUDE) {
-      host="api.anthropic.com";
-      url="https://"+host+"/v1/messages";
-      body="{\"model\":\""+AZTJsonEscape(AZTAI_Model[provider])+"\",\"max_tokens\":"+(string)maxTokens+","
-           "\"system\":\""+AZTJsonEscape(system)+"\","
-           "\"messages\":[{\"role\":\"user\",\"content\":\""+AZTJsonEscape(prompt)+"\"}]}";
-      headers="Content-Type: application/json\r\nx-api-key: "+AZTAI_Key[provider]+"\r\nanthropic-version: 2023-06-01\r\n";
-   } else {
-      host="generativelanguage.googleapis.com";
-      url="https://"+host+"/v1beta/models/"+AZTAI_Model[provider]+":generateContent";
-      body="{\"systemInstruction\":{\"parts\":[{\"text\":\""+AZTJsonEscape(system)+"\"}]},"
-           "\"contents\":[{\"role\":\"user\",\"parts\":[{\"text\":\""+AZTJsonEscape(prompt)+"\"}]}],"
-           "\"generationConfig\":{\"temperature\":0.2,\"responseMimeType\":\"application/json\"}}";
-      headers="Content-Type: application/json\r\nx-goog-api-key: "+AZTAI_Key[provider]+"\r\n";
-   }
+   host="api.anthropic.com";
+   url="https://"+host+"/v1/messages";
+   body="{\"model\":\""+AZTJsonEscape(AZTAI_Model[provider])+"\",\"max_tokens\":"+(string)maxTokens+","
+        "\"system\":\""+AZTJsonEscape(system)+"\","
+        "\"messages\":[{\"role\":\"user\",\"content\":\""+AZTJsonEscape(prompt)+"\"}]}";
+   headers="Content-Type: application/json\r\nx-api-key: "+AZTAI_Key[provider]+"\r\nanthropic-version: 2023-06-01\r\n";
    int http=AZTAIPost(url,headers,body,result,err);
    if(http!=200) { error=AZTAIHttpError(http,err,result,host); return false; }
-   string anchor=provider==AZT_AI_CLAUDE ? "\"content\"" : "\"candidates\"";
+   string anchor="\"content\"";
    text=AZTJsonString(result,"text",MathMax(0,StringFind(result,anchor)));
    if(text=="") { error="Bo'sh javob"; return false; }
    return true;
@@ -182,10 +168,10 @@ void AZTLessonsAdd(const int provider,const string lesson) {
    int first=MathMax(0,count-29); // keep the newest 30
    int file=FileOpen(AZTLessonsFile(provider),FILE_WRITE|FILE_TXT|FILE_ANSI,'\t',CP_UTF8);
    if(file==INVALID_HANDLE) return;
-   for(int i=first;i<count;i++) FileWrite(file,lines[i]);
+   for(int i=first;i<count;i++) FileWriteString(file,lines[i]+"\r\n");
    string clean=lesson;
    StringReplace(clean,"\n"," "); StringReplace(clean,"\r"," ");
-   FileWrite(file,TimeToString(TimeCurrent(),TIME_DATE)+" "+_Symbol+": "+AZTTrimTo(clean,220));
+   FileWriteString(file,TimeToString(TimeCurrent(),TIME_DATE)+" "+_Symbol+": "+AZTTrimTo(clean,220)+"\r\n");
    FileClose(file);
 }
 
