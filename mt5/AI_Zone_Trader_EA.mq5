@@ -31,6 +31,7 @@ input ulong MagicNumber = 260916;
 
 input group "3. Stop loss va 3 qismli take profit"
 input double StopATR = 1.5;              // SL kamida shuncha ATR
+input double SLBufferATR = 0.5;          // SL swing/zona chegarasidan shuncha ATR nari (eski 0.2: wick bilan tez urilardi)
 input int SwingLookback = 10;            // SL oxirgi swing ortiga qo'yiladi
 input double TP1_R = 1.5;                // TP1 = asosiy TP yo'lining 50%i
 input double TP1ClosePercent = 50;       // TP1 da yopiladigan qism, %
@@ -121,6 +122,7 @@ struct LocalSignal {
    int side; // 1 = BUY, -1 = SELL
    datetime time;
    double entry, sl, tp1, tp2, tp3, atr;
+   double zoneTop, zoneBottom; // Kirish zonasi: narx shu oraliqda bo'lganda kiriladi
    string setup;
    int score;      // Confluence: agreeing minus opposing classic factors
    string factors; // One line per factor, for Telegram and the AI
@@ -201,12 +203,15 @@ bool EvaluateSignal(int shift, LocalSignal &signal, string &reason) {
    signal.side=side; signal.time=Rates[shift].time; signal.atr=ATR[shift];
    signal.setup=structure ? structureSetup : (EnableCrossSignals && cross) ? "EMA cross" : "EMA pullback";
    signal.entry=TickPrice(Rates[shift].close);
+   // Entry zone: the structure zone (OB, broken level, trendline), else the EMA21 band.
+   signal.zoneTop=Fast[shift]+0.25*signal.atr; signal.zoneBottom=Fast[shift]-0.25*signal.atr;
+   if(structure) { signal.zoneTop=StructureSignals[shift].zoneTop; signal.zoneBottom=StructureSignals[shift].zoneBottom; }
    double extreme=(side==1 ? Rates[shift].low : Rates[shift].high);
    for(int i=shift+1;i<shift+SwingLookback;i++)
       extreme=side==1 ? MathMin(extreme,Rates[i].low) : MathMax(extreme,Rates[i].high);
    if(structure && structureStop>0)
       extreme=side==1 ? MathMin(extreme,structureStop) : MathMax(extreme,structureStop);
-   double distance=MathMax(StopATR*signal.atr,MathAbs(signal.entry-extreme)+0.2*signal.atr);
+   double distance=MathMax(StopATR*signal.atr,MathAbs(signal.entry-extreme)+SLBufferATR*signal.atr);
    signal.sl=TickPrice(signal.entry-side*distance,-side);
    distance=MathAbs(signal.entry-signal.sl);
    signal.tp1=TickPrice(signal.entry+side*distance*TP1_R,side);
@@ -257,6 +262,15 @@ void DrawSignal(const LocalSignal &signal, bool historical) {
    ObjectSetString(0,name,OBJPROP_TOOLTIP,(historical ? "HISTORICAL " : "LIVE ")+side+" "+
       TimeToString(signal.time)+" | "+signal.setup+" | Entry "+Price(signal.entry)+" | SL "+Price(signal.sl));
    if(DrawLevels) {
+      if(signal.zoneTop>0 && !historical) {
+         string zone=Prefix+"Z_"+(string)(long)signal.time;
+         ObjectDelete(0,zone);
+         ObjectCreate(0,zone,OBJ_RECTANGLE,0,signal.time,signal.zoneTop,signal.time+PeriodSeconds(TF)*StructureExtendBars,signal.zoneBottom);
+         ObjectSetInteger(0,zone,OBJPROP_COLOR,signal.side==1 ? clrSeaGreen : clrIndianRed);
+         ObjectSetInteger(0,zone,OBJPROP_FILL,true); ObjectSetInteger(0,zone,OBJPROP_BACK,true);
+         ObjectSetInteger(0,zone,OBJPROP_SELECTABLE,false);
+         ObjectSetString(0,zone,OBJPROP_TOOLTIP,"Kirish zonasi | "+signal.setup);
+      }
       Level("Entry",signal.entry,clrGold); Level("SL",signal.sl,clrTomato);
       Level("TP1 "+DoubleToString(TP1ClosePercent,0)+"%",signal.tp1,clrLimeGreen);
       Level("TP2 "+DoubleToString(TP2ClosePercent,0)+"%",signal.tp2,clrLimeGreen);
@@ -392,6 +406,8 @@ string SignalText(const LocalSignal &signal, bool volumeOk, double volume, doubl
    string h1=HTFTrendWord(0,AIHigherTF1,d1), h2=HTFTrendWord(1,AIHigherTF2,d2);
    string text="📊 SIGNAL | "+_Symbol+" "+StringSubstr(EnumToString(TF),7)+" | "+(signal.side==1 ? "🟢 BUY" : "🔴 SELL")+
       "\nSetup: "+signal.setup+"\nSham yopildi (broker vaqti): "+TimeToString(signal.time)+
+      (signal.zoneTop>0 ? "\n🧭 Zona: "+Price(signal.zoneBottom)+" – "+Price(signal.zoneTop)+
+                          " (SL zona chegarasidan "+DoubleToString(SLBufferATR,2)+" ATR past)" : "")+
       "\n━━━━━━━━━━━━━━"+
       "\n▶️ Kirish: "+Price(signal.entry)+" (bozor narxida)"+
       "\n🛑 Stop Loss: "+Price(signal.sl)+" ("+Distance(risk)+")"+
@@ -624,6 +640,19 @@ void ReportClosedPositions() {
    }
 }
 
+// Every live signal is appended to MQL5/Files/AZT_signals.csv, so other tools (Ali) can read it.
+void ExportSignal(const LocalSignal &signal) {
+   int h=FileOpen("AZT_signals.csv",FILE_READ|FILE_WRITE|FILE_TXT|FILE_ANSI|FILE_SHARE_READ);
+   if(h==INVALID_HANDLE) { Print("AZT: signal CSV ochilmadi: ",GetLastError()); return; }
+   if(FileSize(h)==0) FileWriteString(h,"time,symbol,timeframe,side,setup,entry,sl,tp1,tp2,tp3,zone_low,zone_high,score,atr\r\n");
+   FileSeek(h,0,SEEK_END);
+   FileWriteString(h,TimeToString(signal.time,TIME_DATE|TIME_MINUTES)+","+_Symbol+","+EnumToString(TF)+","+
+      (signal.side==1 ? "BUY" : "SELL")+","+signal.setup+","+Price(signal.entry)+","+Price(signal.sl)+","+
+      Price(signal.tp1)+","+Price(signal.tp2)+","+Price(signal.tp3)+","+Price(signal.zoneBottom)+","+
+      Price(signal.zoneTop)+","+(string)signal.score+","+DoubleToString(signal.atr,_Digits)+"\r\n");
+   FileClose(h);
+}
+
 void Scan() {
    if(!Ready) {
       int count=RequiredBars()+HistoryBars;
@@ -669,6 +698,7 @@ void Scan() {
       " SL "+Price(signal.sl)+" TP1 "+Price(signal.tp1)+" TP2 "+Price(signal.tp2)+" TP3 "+Price(signal.tp3);
    Print(message);
    if(!MQLInfoInteger(MQL_TESTER)) {
+      ExportSignal(signal);
       if(PopupAlerts) Alert(message);
       if(PushNotifications && !SendNotification(message)) Print("Push notification failed: ",GetLastError());
    }
@@ -861,7 +891,7 @@ void Button(string name, int y, string text) {
 int OnInit() {
    if(FastEMA<2 || SlowEMA<=FastEMA || SlowEMA>1000 || RSIPeriod<2 || RSIPeriod>1000 ||
       ATRPeriod<2 || ATRPeriod>1000 || SwingLookback<1 || SwingLookback>500 ||
-      HistoryBars<0 || HistoryBars>5000 || HistoryMaxHoldingBars<1 || HistoryMaxHoldingBars>2000 ||
+      SLBufferATR<0 || HistoryBars<0 || HistoryBars>5000 || HistoryMaxHoldingBars<1 || HistoryMaxHoldingBars>2000 ||
       HistoryRoundTripCostPoints<0 || CooldownBars<0 || MaxSignalDelaySeconds<1 || StopATR<=0 ||
       StructureLookback<50 || StructureLookback>2000 || PivotBars<1 || PivotBars>20 ||
       OBSearchBars<1 || OBSearchBars>100 || OBImpulseATR<=0 || MaxOrderBlocks<1 || MaxOrderBlocks>30 ||

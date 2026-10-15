@@ -26,6 +26,7 @@ struct AZTStructureSignal {
    int side;
    string setup;
    double stopAnchor;
+   double zoneTop, zoneBottom; // Kirish zonasi (OB, buzilgan daraja yoki trendline atrofi)
 };
 AZTStructureSignal StructureSignals[];
 bool StructureCacheReady=false;
@@ -175,6 +176,7 @@ void FindStructureSetup(int shift,AZTStructureSignal &candidate) {
          candidate.setup="Fresh order-block rejection";
          candidate.stopAnchor=candidate.side==1 ? MathMin(Blocks[i].bottom,Rates[shift].low)
                                                 : MathMax(Blocks[i].top,Rates[shift].high);
+         candidate.zoneTop=Blocks[i].top; candidate.zoneBottom=Blocks[i].bottom;
          return;
       }
    }
@@ -184,6 +186,7 @@ void FindStructureSetup(int shift,AZTStructureSignal &candidate) {
          candidate.side=1;
          candidate.setup=StructureBias<0 ? "Bullish CHOCH impulse" : "Bullish BOS impulse";
          candidate.stopAnchor=LowPivot.time>0 ? MathMin(LowPivot.price,Rates[shift].low) : Rates[shift].low;
+         candidate.zoneTop=HighPivot.price+0.2*ATR[shift]; candidate.zoneBottom=HighPivot.price-0.2*ATR[shift];
          return;
       }
       if(LowPivot.time>0 && !LowPivot.broken && Rates[shift].close<LowPivot.price &&
@@ -191,6 +194,7 @@ void FindStructureSetup(int shift,AZTStructureSignal &candidate) {
          candidate.side=-1;
          candidate.setup=StructureBias>0 ? "Bearish CHOCH impulse" : "Bearish BOS impulse";
          candidate.stopAnchor=HighPivot.time>0 ? MathMax(HighPivot.price,Rates[shift].high) : Rates[shift].high;
+         candidate.zoneTop=LowPivot.price+0.2*ATR[shift]; candidate.zoneBottom=LowPivot.price-0.2*ATR[shift];
          return;
       }
    }
@@ -202,6 +206,7 @@ void FindStructureSetup(int shift,AZTStructureSignal &candidate) {
          Rates[shift].close>line) {
          candidate.side=1; candidate.setup="Rising trendline rejection";
          candidate.stopAnchor=MathMin(Rates[shift].low,LowPivot.price);
+         candidate.zoneTop=line+tolerance; candidate.zoneBottom=line-tolerance;
          return;
       }
    }
@@ -211,6 +216,7 @@ void FindStructureSetup(int shift,AZTStructureSignal &candidate) {
          Rates[shift].close<line) {
          candidate.side=-1; candidate.setup="Falling trendline rejection";
          candidate.stopAnchor=MathMax(Rates[shift].high,HighPivot.price);
+         candidate.zoneTop=line+tolerance; candidate.zoneBottom=line-tolerance;
       }
    }
 }
